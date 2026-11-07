@@ -13,7 +13,6 @@ Adds Steam and SteamDB buttons to game pages on [byxatab.com](https://byxatab.co
   - Extracts Steam App ID from game pages with automatic caching via ScriptCat / Tampermonkey storage.
   - One-click navigation to Steam Store and SteamDB pages.
   - Native styling for both light and dark modes.
-  - Full compatibility with Steam Web Integration (SWI) badges.
 
 ## License
 
