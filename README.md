@@ -14,7 +14,7 @@ Adds Steam and SteamDB buttons to game pages on [byxatab.com](https://byxatab.co
 Displays the commenter's subscriber count next to their username on YouTube.
 
 - **File:** [`youtube-commenter-subscribers.user.js`](youtube-commenter-subscribers.user.js)
-- **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/youtube-commenter-subscribers.user.js)
+- **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/youtube-commenter-subscribers.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/604261-youtube-commenter-subscribers)
 
 ### YouTube - Default To Live Chat
 Automatically switches YouTube chat from Top Chat to Live Chat, with minimal CPU usage.
