@@ -22,6 +22,12 @@ Automatically switches YouTube chat from Top Chat to Live Chat, with minimal CPU
 - **File:** [`youtube-default-to-live-chat.user.js`](youtube-default-to-live-chat.user.js)
 - **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/youtube-default-to-live-chat.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/604260-youtube-default-to-live-chat)
 
+### YouTube - Livechat GoToChannel
+Restores the "Go to channel" option in YouTube live chat with instant context menus, hover prefetching, and debounce bypass.
+
+- **File:** [`youtube-livechat-gotochannel.user.js`](youtube-livechat-gotochannel.user.js)
+- **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/youtube-livechat-gotochannel.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/604353-youtube-livechat-gotochannel)
+
 ## License
 
 This repository is licensed under the [MIT License](LICENSE).
