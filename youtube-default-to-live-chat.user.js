@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Default To Live Chat
 // @namespace    https://github.com/EndzE
-// @version      1.5.0
+// @version      1.5.1
 // @description  Automatically switches YouTube chat from Top Chat to Live Chat, with minimal CPU usage.
 // @author       EndzE
 // @license      MIT
@@ -19,8 +19,8 @@
 (function () {
     'use strict';
 
-    const POLL_INTERVAL_MS = 300;
-    const MAX_DURATION_MS = 30000;
+    const POLL_INTERVAL_MS = 250;
+    const MAX_DURATION_MS = 15000;
 
     let pollTimer = null;
     let stopTimer = null;
@@ -34,6 +34,11 @@
             clearTimeout(stopTimer);
             stopTimer = null;
         }
+    }
+
+    function isWatchPage() {
+        const path = window.location.pathname;
+        return path.startsWith('/watch') || path.startsWith('/live');
     }
 
     function isLiveChatSelected(anchor) {
@@ -55,14 +60,41 @@
         }
     }
 
+    function attachIframeListener() {
+        const iframe = document.querySelector('iframe#chatframe');
+        if (!iframe || iframe.__defaultLiveChatHooked) return;
+        iframe.__defaultLiveChatHooked = true;
+        iframe.addEventListener('load', () => {
+            start();
+        });
+    }
+
     function poll() {
+        if (!isWatchPage()) {
+            cleanup();
+            return;
+        }
+
+        attachIframeListener();
+
         const chatDoc = getChatDoc();
         if (!chatDoc) return;
+
+        let docHref = '';
+        try {
+            docHref = chatDoc.location?.href || '';
+        } catch {
+            return;
+        }
+
+        if (!docHref || docHref === 'about:blank') return;
 
         const subMenu = chatDoc.getElementById('live-chat-view-selector-sub-menu');
         if (!subMenu) return;
 
         const items = subMenu.querySelectorAll('tp-yt-paper-listbox > a.yt-simple-endpoint');
+        if (items.length < 2) return;
+
         const liveChatAnchor = Array.from(items).find(a => /live\s*chat/i.test(a.textContent)) || items[1];
         if (!liveChatAnchor) return;
 
@@ -86,16 +118,21 @@
     }
 
     function start() {
+        if (!isWatchPage()) {
+            cleanup();
+            return;
+        }
+
         cleanup();
         pollTimer = setInterval(poll, POLL_INTERVAL_MS);
         poll(); // Try immediately
 
         stopTimer = setTimeout(() => {
-            console.debug('[Default To Live Chat] gave up after 30s — menu never switched');
             cleanup();
         }, MAX_DURATION_MS);
     }
 
     start();
     window.addEventListener('yt-navigate-finish', start);
+    window.addEventListener('yt-page-data-updated', start);
 })();
