@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Commenter Subscribers
 // @namespace    https://github.com/EndzE
-// @version      1.1.2
+// @version      1.1.3
 // @description  Displays the commenter's subscriber count next to their username on YouTube.
 // @author       EndzE
 // @license      MIT
@@ -50,7 +50,7 @@
   // Regex pattern for YouTube aboutChannelViewModel subscriberCountText
   const REGEX_SUB_TEXT = /"subscriberCountText":"([^"]+)"/;
   const SUB_LANG_REGEX =
-    /subscriber|abonn|suscri|subskry|подпис|inscrit|登録者|구독자|订阅|مشترك/i;
+    /subscri|suscri|subskry|abon|подпис|підпис|падпіс|абон|претплат|pretplat|iscritt|inscrit|prenumer|odběrat|odbera|tilaaj|tellij|feliratkoz|εγγεγραμμ|συνδρομητ|מנוי|登録者|구독자|订阅|訂閱|مشتر[كک]|सदस्य|গ্রাহক|ผู้ติดตาม|đăng ký|pelanggan|langganan/i;
 
   const subCache = new Map();
 
