@@ -19,7 +19,7 @@
 (() => {
   'use strict';
 
-  console.log('Commenter Subscribers for YouTube™ initialized');
+  console.log('Commenter Subscribers for YouTube™ initialized.');
 
   const css = `
     .subscriber-count {
