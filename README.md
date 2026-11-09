@@ -8,7 +8,7 @@ A collection of useful userscripts.
 Adds Steam, Epic Games, and GOG buttons to game pages on [byxatab.com](https://byxatab.com/) styled to seamlessly match the site design in both light and dark themes.
 
 - **File:** [`byxatab-store-buttons.user.js`](byxatab-store-buttons.user.js)
-- **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/byxatab-store-buttons.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/604250-byxatab-steam-steamdb-buttons)
+- **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/byxatab-store-buttons.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/604250-byxatab-store-buttons)
 
 ### YouTube - Commenter Subscribers
 Displays the commenter's subscriber count next to their username on YouTube.
