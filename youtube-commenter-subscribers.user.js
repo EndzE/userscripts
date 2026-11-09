@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Commenter Subscribers
 // @namespace    https://github.com/EndzE
-// @version      1.1.3
+// @version      1.2.0
 // @description  Displays the commenter's subscriber count next to their username on YouTube.
 // @author       EndzE
 // @license      MIT
@@ -19,23 +19,33 @@
 (() => {
   'use strict';
 
-  console.log('Commenter Subscribers for YouTube™ initialized.');
+  console.log('[Commenter Subscribers] Initializing optimized v1.2.0');
 
   const css = `
     .subscriber-count {
       font-size: 1.1rem;
       line-height: normal;
-      color: #ddd;
-      background-color: #333;
-      margin-left: 4px;
-      padding: 1px 3px;
-      border-radius: 3px;
+      color: #0f0f0f;
+      background-color: rgba(0, 0, 0, 0.06);
+      margin-left: 6px;
+      padding: 1px 4px;
+      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      font-weight: 400;
+      vertical-align: middle;
+      user-select: none;
+    }
+    html[dark] .subscriber-count {
+      color: #f1f1f1;
+      background-color: rgba(255, 255, 255, 0.12);
     }
     .subscriber-count.is-private {
+      opacity: 0.75;
       font-style: italic;
     }
     .subscriber-count.is-loading {
-      visibility: hidden;
+      display: none;
     }
   `;
 
@@ -52,60 +62,107 @@
   const SUB_LANG_REGEX =
     /subscri|suscri|subskry|abon|подпис|підпис|падпіс|абон|претплат|pretplat|iscritt|inscrit|prenumer|odběrat|odbera|tilaaj|tellij|feliratkoz|εγγεγραμμ|συνδρομητ|מנוי|登録者|구독자|订阅|訂閱|مشتر[كک]|सदस्य|গ্রাহক|ผู้ติดตาม|đăng ký|pelanggan|langganan/i;
 
-  const subCache = new Map();
+  // In-flight promises cache & resolved results cache
+  const pendingCache = new Map();
+  const resolvedCache = new Map();
+
+  // Concurrency limiter for network requests (max 4 parallel connections)
+  const MAX_CONCURRENT = 4;
+  let activeRequests = 0;
+  const requestQueue = [];
+
+  const runQueue = () => {
+    while (activeRequests < MAX_CONCURRENT && requestQueue.length > 0) {
+      const task = requestQueue.shift();
+      activeRequests++;
+      task().finally(() => {
+        activeRequests--;
+        runQueue();
+      });
+    }
+  };
+
+  const enqueueRequest = (task) =>
+    new Promise((resolve, reject) => {
+      requestQueue.push(() => task().then(resolve, reject));
+      runQueue();
+    });
 
   /**
-   * Extracts the subscriber count from YouTube channel HTML.
-   * Supports both aboutChannelViewModel ("subscriberCountText") and
-   * the fallback pageHeaderViewModel ("contentMetadataViewModel").
-   * @param {string} html
-   * @returns {string|null} Subscriber string, or null if private/0 subs.
+   * Fast fallback regex on pageHeaderRenderer metadata when subscriberCountText is missing.
+   * Eliminates heavy JSON.parse calls on large payloads and prevents false positives.
+   * @param {string} text
+   * @returns {string|null}
    */
-  const extractSubCount = (html) => {
-    // 1. Direct match from aboutChannelViewModel (/about endpoint)
-    const match = html.match(REGEX_SUB_TEXT);
-    if (match) return match[1];
+  const extractFallback = (text) => {
+    const marker = '"pageHeaderRenderer":';
+    const start = text.indexOf(marker);
+    if (start === -1) return null;
 
-    // 2. Fallback: Parse ytInitialData pageHeaderViewModel if /about format changes
-    const marker = 'var ytInitialData = ';
-    const start = html.indexOf(marker);
-    if (start !== -1) {
-      const jsonStart = start + marker.length;
-      const scriptEnd = html.indexOf(';</script>', jsonStart);
-      if (scriptEnd !== -1) {
-        try {
-          const data = JSON.parse(html.slice(jsonStart, scriptEnd));
-          const rows =
-            data?.header?.pageHeaderRenderer?.content?.pageHeaderViewModel
-              ?.metadata?.contentMetadataViewModel?.metadataRows;
-
-          if (Array.isArray(rows)) {
-            const parts = rows.flatMap((row) => row.metadataParts || []);
-            for (const part of parts) {
-              const content = part?.text?.content;
-              const label = part?.accessibilityLabel || '';
-              if (
-                content &&
-                !content.startsWith('@') &&
-                (SUB_LANG_REGEX.test(`${content} ${label}`) ||
-                  (part.accessibilityLabel && !part.text?.styleRuns))
-              ) {
-                return content;
-              }
-            }
-            return null;
-          }
-        } catch {
-          // Fall through
-        }
+    const headerSlice = text.slice(start, start + 3500);
+    const regex = /"text":\{"content":"([^"]+)"\},"accessibilityLabel":"([^"]*)"/g;
+    let m;
+    while ((m = regex.exec(headerSlice)) !== null) {
+      const content = m[1];
+      const label = m[2];
+      if (
+        content &&
+        !content.startsWith('@') &&
+        SUB_LANG_REGEX.test(`${content} ${label}`)
+      ) {
+        return content;
       }
     }
-
     return null;
   };
 
   /**
-   * Normalizes the channel URL and fetches/caches the subscriber count.
+   * Fetches subscriber count using ReadableStream early exit.
+   * Aborts downloading the remainder of the ~1MB page as soon as subscriberCountText is matched.
+   * @param {string} channelUrl
+   * @returns {Promise<string|null>}
+   */
+  const fetchSubscriberCount = async (channelUrl) => {
+    try {
+      const res = await fetch(`${channelUrl}/about`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      if (!res.body || typeof res.body.getReader !== 'function') {
+        const text = await res.text();
+        const match = text.match(REGEX_SUB_TEXT);
+        return match ? match[1] : extractFallback(text);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const match = buffer.match(REGEX_SUB_TEXT);
+        if (match) {
+          reader.cancel().catch(() => {});
+          return match[1];
+        }
+
+        // Keep 256KB sliding buffer to preserve pageHeaderRenderer metadata if fallback is needed
+        if (buffer.length > 393216) {
+          buffer = buffer.slice(-262144);
+        }
+      }
+
+      return extractFallback(buffer);
+    } catch (err) {
+      console.warn('[Commenter Subscribers] Fetch failed for:', channelUrl, err);
+      return '__ERROR__';
+    }
+  };
+
+  /**
+   * Normalizes channel URL and manages queued fetching with caching.
    * @param {string} rawUrl
    * @returns {Promise<string|null>}
    */
@@ -118,45 +175,69 @@
       return Promise.resolve(null);
     }
 
-    if (subCache.has(channelUrl)) {
-      return subCache.get(channelUrl);
+    if (resolvedCache.has(channelUrl)) {
+      return Promise.resolve(resolvedCache.get(channelUrl));
     }
 
-    // Keep default same-origin credentials so YouTube cookies/consent are sent
-    const fetchPromise = fetch(`${channelUrl}/about`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.text();
+    if (pendingCache.has(channelUrl)) {
+      return pendingCache.get(channelUrl);
+    }
+
+    const promise = enqueueRequest(() => fetchSubscriberCount(channelUrl))
+      .then((result) => {
+        pendingCache.delete(channelUrl);
+        if (result !== '__ERROR__') {
+          resolvedCache.set(channelUrl, result);
+        }
+        return result;
       })
-      .then(extractSubCount)
-      .catch((err) => {
-        subCache.delete(channelUrl);
-        console.warn('[Commenter Subscribers] Fetch failed:', err);
+      .catch(() => {
+        pendingCache.delete(channelUrl);
         return '__ERROR__';
       });
 
-    subCache.set(channelUrl, fetchPromise);
-    return fetchPromise;
+    pendingCache.set(channelUrl, promise);
+    return promise;
   };
 
   /**
-   * Updates the subscriber badge for a specific comment.
+   * Updates badge DOM with subscriber count or private status.
+   * Renders synchronously without loading flicker if already in resolved cache.
+   * @param {HTMLAnchorElement} anchor
+   * @param {HTMLElement} badge
    */
   const updateBadge = async (anchor, badge) => {
     const targetUrl = anchor.href;
     if (!targetUrl) return;
 
-    badge.classList.add('is-loading');
-    const subCount = await getSubs(targetUrl);
+    // Check synchronous cache first for zero layout shift / instant render
+    let normalizedUrl;
+    try {
+      const parsed = new URL(targetUrl, location.origin);
+      normalizedUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
+    } catch {}
 
-    // Abort if YouTube recycled this comment element while the request was in flight
-    if (anchor.href !== targetUrl) return;
-
-    if (subCount === '__ERROR__') {
-      // Keep hidden if the network request itself failed
+    if (normalizedUrl && resolvedCache.has(normalizedUrl)) {
+      const cached = resolvedCache.get(normalizedUrl);
+      applyBadgeContent(badge, cached);
       return;
     }
 
+    badge.classList.add('is-loading');
+    const subCount = await getSubs(targetUrl);
+
+    // Abort if YouTube recycled this comment element while request was pending
+    if (anchor.href !== targetUrl) return;
+
+    if (subCount === '__ERROR__') {
+      badge.classList.add('is-loading');
+      return;
+    }
+
+    applyBadgeContent(badge, subCount);
+  };
+
+  const applyBadgeContent = (badge, subCount) => {
     if (subCount === null) {
       badge.textContent = 'Private';
       badge.classList.add('is-private');
@@ -164,7 +245,6 @@
       badge.textContent = subCount;
       badge.classList.remove('is-private');
     }
-
     badge.classList.remove('is-loading');
   };
 
@@ -195,15 +275,9 @@
     }
 
     updateBadge(anchor, badge);
-
-    const hrefObserver = new MutationObserver(() => updateBadge(anchor, badge));
-    hrefObserver.observe(anchor, {
-      attributes: true,
-      attributeFilter: ['href'],
-    });
   };
 
-  // Lazy-load subscriber counts only when comments are scrolled near the viewport
+  // Viewport observer with 400px margin for pre-emptive loading before scroll-in
   const viewportObserver = new IntersectionObserver(
     (entries, observer) => {
       for (const entry of entries) {
@@ -213,38 +287,109 @@
         }
       }
     },
-    { rootMargin: '300px 0px' }
+    { rootMargin: '400px 0px' }
   );
 
-  let scanScheduled = false;
+  const seenComments = new WeakSet();
 
-  const processComments = () => {
-    scanScheduled = false;
-    const comments = document.querySelectorAll(
-      'ytd-comment-view-model:not([data-sub-count-added])'
-    );
-
-    for (const comment of comments) {
-      const header = comment.querySelector('div#header-author');
-      if (!header || !getAuthorAnchor(header)) continue;
-
-      comment.dataset.subCountAdded = 'true';
-      viewportObserver.observe(comment);
-    }
+  const queueComment = (commentElement) => {
+    if (!commentElement || seenComments.has(commentElement)) return;
+    seenComments.add(commentElement);
+    viewportObserver.observe(commentElement);
   };
 
-  const scheduleScan = () => {
-    if (!scanScheduled) {
-      scanScheduled = true;
-      requestAnimationFrame(processComments);
+  // Single shared MutationObserver scoped strictly to the comments container.
+  // Replaces hundreds of per-comment href observers and eliminates global document.body scans.
+  const commentsObserver = new MutationObserver((mutations) => {
+    for (let i = 0; i < mutations.length; i++) {
+      const m = mutations[i];
+
+      // Handle element reuse / href changes (virtual DOM recycling)
+      if (m.type === 'attributes' && m.attributeName === 'href') {
+        const anchor = m.target;
+        if (
+          anchor &&
+          anchor.matches?.('a#author-text, a#name, a[href^="/@"], a[href^="/channel/"]')
+        ) {
+          const header = anchor.closest('div#header-author');
+          if (header) {
+            const badge = header.querySelector('.subscriber-count');
+            if (badge) updateBadge(anchor, badge);
+          }
+        }
+        continue;
+      }
+
+      // Handle newly added comments and thread blocks
+      const added = m.addedNodes;
+      for (let j = 0; j < added.length; j++) {
+        const node = added[j];
+        if (node.nodeType !== 1) continue;
+
+        if (node.tagName === 'YTD-COMMENT-VIEW-MODEL') {
+          queueComment(node);
+        } else if (node.firstElementChild) {
+          const comments = node.getElementsByTagName('ytd-comment-view-model');
+          for (let k = 0; k < comments.length; k++) {
+            queueComment(comments[k]);
+          }
+        }
+      }
     }
+  });
+
+  const attachCommentsObserver = () => {
+    const container =
+      document.querySelector('ytd-comments') ||
+      document.querySelector('#comments');
+
+    if (!container) return false;
+
+    commentsObserver.observe(container, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['href'],
+    });
+
+    // Process any comments already present in the container
+    const existing = container.getElementsByTagName('ytd-comment-view-model');
+    for (let i = 0; i < existing.length; i++) {
+      queueComment(existing[i]);
+    }
+
+    return true;
   };
 
-  processComments();
+  let pageObserver = null;
 
-  const bodyObserver = new MutationObserver(scheduleScan);
-  bodyObserver.observe(document.body, {
-    childList: true,
-    subtree: true,
+  const init = () => {
+    if (attachCommentsObserver()) return;
+
+    // Lightweight bootstrap observer: waits only until ytd-comments appears, then self-disconnects
+    pageObserver = new MutationObserver(() => {
+      if (attachCommentsObserver()) {
+        pageObserver.disconnect();
+        pageObserver = null;
+      }
+    });
+
+    const pageTarget =
+      document.querySelector('ytd-page-manager') ||
+      document.body;
+
+    pageObserver.observe(pageTarget, { childList: true, subtree: true });
+  };
+
+  init();
+
+  // Clean SPA navigation handling
+  window.addEventListener('yt-navigate-finish', () => {
+    commentsObserver.disconnect();
+    if (pageObserver) {
+      pageObserver.disconnect();
+      pageObserver = null;
+    }
+    init();
   });
 })();
