@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Commenter Subscribers
 // @namespace    https://github.com/EndzE
-// @version      1.3.0
+// @version      1.4.0
 // @description  Displays the commenter's subscriber count next to their username on YouTube.
 // @author       EndzE
 // @license      MIT
@@ -10,6 +10,8 @@
 // @supportURL   https://github.com/EndzE/userscripts/issues
 // @match        https://*.youtube.com/*
 // @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @noframes
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/EndzE/userscripts/main/youtube-commenter-subscribers.user.js
@@ -19,7 +21,7 @@
 (() => {
   'use strict';
 
-  console.log('[Commenter Subscribers] Initializing v1.3.0');
+  console.log('[Commenter Subscribers] Initializing v1.4.0 (GM Storage 24h TTL + LIFO + AbortController)');
 
   const css = `
     .subscriber-count {
@@ -35,6 +37,8 @@
       font-weight: 400;
       vertical-align: middle;
       user-select: none;
+      contain: layout style;
+      white-space: nowrap;
     }
     html[dark] .subscriber-count,
     [dark] .subscriber-count {
@@ -63,21 +67,74 @@
   const SUB_LANG_REGEX =
     /subscri|suscri|subskry|abon|подпис|підпис|падпіс|абон|претплат|pretplat|iscritt|inscrit|prenumer|odběrat|odbera|tilaaj|tellij|feliratkoz|εγγεγραμμ|συνδρομητ|מנוי|登録者|구독자|订阅|訂閱|مشتر[كک]|सदस्य|গ্রাহক|ผู้ติดตาม|đăng ký|pelanggan|langganan/i;
 
-  // Multi-tier cache: L1 Memory Map + L2 SessionStorage persistence
-  const STORAGE_KEY = 'yt_subscribers_cache';
-  const MAX_STORAGE_ENTRIES = 400;
+  // Multi-tier cache: L1 Memory Map + L2 GM Storage with 24-hour TTL & cross-tab persistence
+  const STORAGE_KEY = 'yt_subscribers_cache_v2';
+  const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+  const MAX_STORAGE_ENTRIES = 1000;
   const pendingCache = new Map();
   const resolvedCache = new Map();
+  const cacheExpiry = new Map();
 
-  // Hydrate L1 cache from sessionStorage for instant 0ms renders on reloads
+  // Helper to read persistent GM / localStorage
+  const readPersistentStorage = () => {
+    try {
+      if (typeof GM_getValue === 'function') {
+        const val = GM_getValue(STORAGE_KEY, null);
+        if (val) return typeof val === 'string' ? JSON.parse(val) : val;
+      }
+    } catch {}
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Helper to write persistent GM / localStorage
+  const writePersistentStorage = (payload) => {
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(STORAGE_KEY, payload);
+        return;
+      }
+    } catch {}
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch {}
+  };
+
+  // Safe cache accessor that verifies 24-hour TTL
+  const getCachedValue = (key) => {
+    if (!key || !resolvedCache.has(key)) return undefined;
+    const exp = cacheExpiry.get(key);
+    if (exp && Date.now() > exp) {
+      resolvedCache.delete(key);
+      cacheExpiry.delete(key);
+      return undefined;
+    }
+    return resolvedCache.get(key);
+  };
+
+  // Hydrate L1 cache from persistent GM storage with 24h TTL filtering
   try {
-    const stored = sessionStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      for (const [k, v] of Object.entries(parsed)) {
-        resolvedCache.set(k, v);
+    const now = Date.now();
+    const stored = readPersistentStorage();
+    if (stored && typeof stored === 'object') {
+      for (const [k, item] of Object.entries(stored)) {
+        if (item && typeof item === 'object' && 'exp' in item) {
+          if (item.exp > now && item.val !== '__ERROR__') {
+            resolvedCache.set(k, item.val);
+            cacheExpiry.set(k, item.exp);
+          }
+        } else if (item !== '__ERROR__') {
+          resolvedCache.set(k, item);
+          cacheExpiry.set(k, now + CACHE_TTL_MS);
+        }
       }
     }
+    // Clean up legacy sessionStorage if present
+    sessionStorage.removeItem('yt_subscribers_cache');
   } catch {}
 
   let saveTimer = null;
@@ -86,15 +143,19 @@
     saveTimer = setTimeout(() => {
       saveTimer = null;
       try {
+        const now = Date.now();
         const payload = {};
         let count = 0;
         for (const [k, v] of resolvedCache.entries()) {
           if (v !== '__ERROR__') {
-            payload[k] = v;
-            if (++count >= MAX_STORAGE_ENTRIES) break;
+            const exp = cacheExpiry.get(k) || (now + CACHE_TTL_MS);
+            if (exp > now) {
+              payload[k] = { val: v, exp };
+              if (++count >= MAX_STORAGE_ENTRIES) break;
+            }
           }
         }
-        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+        writePersistentStorage(payload);
       } catch {}
     }, 1500);
   };
@@ -109,27 +170,57 @@
       : { client: { clientName: 'WEB', clientVersion: '2.20261105.05.01' } };
   };
 
-  // Concurrency limiter for network requests (max 6 parallel connections)
+  // Concurrency limiter with LIFO priority scheduling and AbortSignal support
   const MAX_CONCURRENT = 6;
   let activeRequests = 0;
   const requestQueue = [];
 
   const runQueue = () => {
     while (activeRequests < MAX_CONCURRENT && requestQueue.length > 0) {
-      const task = requestQueue.shift();
+      const item = requestQueue.shift();
+      if (item.signal?.aborted) continue;
       activeRequests++;
-      task().finally(() => {
+      item.run().finally(() => {
         activeRequests--;
         runQueue();
       });
     }
   };
 
-  const enqueueRequest = (task) =>
-    new Promise((resolve, reject) => {
-      requestQueue.push(() => task().then(resolve, reject));
+  const enqueueRequest = (task, signal) => {
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('Aborted', 'AbortError'));
+    }
+
+    return new Promise((resolve, reject) => {
+      let item;
+      const onAbort = () => {
+        const idx = requestQueue.indexOf(item);
+        if (idx !== -1) {
+          requestQueue.splice(idx, 1);
+        }
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+
+      item = {
+        run: () => {
+          if (signal?.aborted) {
+            onAbort();
+            return Promise.reject(new DOMException('Aborted', 'AbortError'));
+          }
+          signal?.removeEventListener('abort', onAbort);
+          return task().then(resolve, reject);
+        },
+        signal,
+      };
+
+      signal?.addEventListener('abort', onAbort, { once: true });
+
+      // LIFO priority: recently visible comments are placed at front to resolve first
+      requestQueue.unshift(item);
       runQueue();
     });
+  };
 
   /**
    * Fast fallback regex on pageHeaderRenderer metadata when subscriberCountText is missing.
@@ -160,14 +251,39 @@
   };
 
   /**
+   * Extracts subscriber text from varied YouTube text objects (simpleText, runs, or content)
+   * without creating heap string allocations.
+   * @param {object} obj
+   * @returns {string|null}
+   */
+  const extractTextObject = (obj) => {
+    if (!obj) return null;
+    if (typeof obj.simpleText === 'string') return obj.simpleText;
+    if (Array.isArray(obj.runs)) {
+      let combined = '';
+      for (let i = 0; i < obj.runs.length; i++) {
+        combined += obj.runs[i]?.text || '';
+      }
+      return combined || null;
+    }
+    if (typeof obj.content === 'string') return obj.content;
+    return null;
+  };
+
+  /**
    * Parses subscriber count directly from InnerTube browse response JSON.
+   * Completely avoids JSON.stringify re-serialization and heap string churn.
    * @param {object} data
    * @returns {string|null}
    */
   const parseInnerTube = (data) => {
     if (!data) return null;
+    const header = data.header;
+    if (!header) return null;
+
+    // 1. Primary modern path: pageHeaderViewModel content metadata rows
     const rows =
-      data?.header?.pageHeaderRenderer?.content?.pageHeaderViewModel?.metadata
+      header.pageHeaderRenderer?.content?.pageHeaderViewModel?.metadata
         ?.contentMetadataViewModel?.metadataRows;
     if (rows) {
       for (let i = 0; i < rows.length; i++) {
@@ -185,15 +301,24 @@
       }
     }
 
-    const legacy =
-      data?.header?.c4TabbedHeaderRenderer?.subscriberCountText?.simpleText;
-    if (legacy) return legacy;
+    // 2. Direct legacy c4TabbedHeaderRenderer lookup
+    const c4 = header.c4TabbedHeaderRenderer?.subscriberCountText;
+    if (c4) {
+      const text = extractTextObject(c4);
+      if (text) return text;
+    }
 
-    const jsonSnippet = JSON.stringify(data.header || {});
-    const subMatch = jsonSnippet.match(
-      /"subscriberCountText":\{[^}]*"simpleText":"([^"]+)"/
-    );
-    if (subMatch) return subMatch[1];
+    // 3. Fast iterative object inspection across all header renderers (zero serialization)
+    for (const key in header) {
+      const renderer = header[key];
+      if (renderer && typeof renderer === 'object') {
+        const sub = renderer.subscriberCountText;
+        if (sub) {
+          const text = extractTextObject(sub);
+          if (text) return text;
+        }
+      }
+    }
 
     return null;
   };
@@ -202,13 +327,15 @@
    * Fetches subscriber count using InnerTube API browse endpoint (~30 KB JSON).
    * 93% faster and 97% lighter than full HTML page fetching.
    * @param {string} browseId
+   * @param {AbortSignal} [signal]
    * @returns {Promise<string|null>}
    */
-  const fetchInnerTube = async (browseId) => {
+  const fetchInnerTube = async (browseId, signal) => {
     const res = await fetch('/youtubei/v1/browse', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ context: getYtContext(), browseId }),
+      signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -219,10 +346,11 @@
    * Fetches subscriber count using ReadableStream early exit as safety fallback.
    * Aborts downloading the remainder of the page as soon as subscriberCountText is matched.
    * @param {string} channelUrl
+   * @param {AbortSignal} [signal]
    * @returns {Promise<string|null>}
    */
-  const fetchSubscriberCountStream = async (channelUrl) => {
-    const res = await fetch(`${channelUrl}/about`);
+  const fetchSubscriberCountStream = async (channelUrl, signal) => {
+    const res = await fetch(`${channelUrl}/about`, { signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     if (!res.body || typeof res.body.getReader !== 'function') {
@@ -236,6 +364,10 @@
     let buffer = '';
 
     while (true) {
+      if (signal?.aborted) {
+        reader.cancel().catch(() => {});
+        throw new DOMException('Aborted', 'AbortError');
+      }
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -259,19 +391,23 @@
    * Unified fetch dispatcher: attempts InnerTube browse first, falls back to stream.
    * @param {string|null} browseId
    * @param {string} channelUrl
+   * @param {AbortSignal} [signal]
    * @returns {Promise<string|null>}
    */
-  const fetchSubscriberCount = async (browseId, channelUrl) => {
+  const fetchSubscriberCount = async (browseId, channelUrl, signal) => {
     try {
       if (browseId) {
-        return await fetchInnerTube(browseId);
+        return await fetchInnerTube(browseId, signal);
       }
-      return await fetchSubscriberCountStream(channelUrl);
+      return await fetchSubscriberCountStream(channelUrl, signal);
     } catch (err) {
-      if (browseId && channelUrl) {
+      if (err.name === 'AbortError') throw err;
+      if (browseId && channelUrl && !signal?.aborted) {
         try {
-          return await fetchSubscriberCountStream(channelUrl);
-        } catch {}
+          return await fetchSubscriberCountStream(channelUrl, signal);
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+        }
       }
       console.warn('[Commenter Subscribers] Fetch failed for:', channelUrl || browseId, err);
       return '__ERROR__';
@@ -294,61 +430,108 @@
 
   /**
    * Normalizes channel target and manages queued fetching with multi-tier caching.
+   * Supports multi-signal reference-counted cancellation.
    * @param {string} rawUrl
    * @param {string|null} browseId
+   * @param {AbortSignal} [signal]
    * @returns {Promise<string|null>}
    */
-  const getSubs = (rawUrl, browseId) => {
+  const getSubs = (rawUrl, browseId, signal) => {
     const channelUrl = normalizeChannelUrl(rawUrl);
     const primaryKey = browseId || channelUrl;
     if (!primaryKey) return Promise.resolve(null);
 
-    if (resolvedCache.has(primaryKey)) {
-      return Promise.resolve(resolvedCache.get(primaryKey));
+    const cachedPrimary = getCachedValue(primaryKey);
+    if (cachedPrimary !== undefined) {
+      return Promise.resolve(cachedPrimary);
     }
-    if (channelUrl && resolvedCache.has(channelUrl)) {
-      return Promise.resolve(resolvedCache.get(channelUrl));
+    if (channelUrl) {
+      const cachedUrl = getCachedValue(channelUrl);
+      if (cachedUrl !== undefined) {
+        return Promise.resolve(cachedUrl);
+      }
     }
 
     if (pendingCache.has(primaryKey)) {
-      return pendingCache.get(primaryKey);
+      const pending = pendingCache.get(primaryKey);
+      if (signal) {
+        if (signal.aborted) {
+          return Promise.reject(new DOMException('Aborted', 'AbortError'));
+        }
+        const onAbort = () => {
+          pending.signals.delete(signal);
+          if (pending.signals.size === 0 && pending.hasSignalListeners) {
+            pending.masterController.abort();
+          }
+        };
+        pending.signals.add(signal);
+        pending.hasSignalListeners = true;
+        signal.addEventListener('abort', onAbort, { once: true });
+        return pending.promise.finally(() => {
+          signal.removeEventListener('abort', onAbort);
+        });
+      }
+      return pending.promise;
     }
 
-    const promise = enqueueRequest(() => fetchSubscriberCount(browseId, channelUrl))
+    const masterController = new AbortController();
+    const signals = new Set();
+    let hasSignalListeners = false;
+
+    if (signal) {
+      if (signal.aborted) {
+        return Promise.reject(new DOMException('Aborted', 'AbortError'));
+      }
+      signals.add(signal);
+      hasSignalListeners = true;
+    }
+
+    const pendingObj = {
+      masterController,
+      signals,
+      hasSignalListeners,
+      promise: null,
+    };
+
+    if (signal) {
+      const onAbort = () => {
+        signals.delete(signal);
+        if (signals.size === 0 && pendingObj.hasSignalListeners) {
+          masterController.abort();
+        }
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    const promise = enqueueRequest(
+      () => fetchSubscriberCount(browseId, channelUrl, masterController.signal),
+      masterController.signal
+    )
       .then((result) => {
         pendingCache.delete(primaryKey);
         if (result !== '__ERROR__') {
+          const exp = Date.now() + CACHE_TTL_MS;
           resolvedCache.set(primaryKey, result);
+          cacheExpiry.set(primaryKey, exp);
           if (channelUrl && channelUrl !== primaryKey) {
             resolvedCache.set(channelUrl, result);
+            cacheExpiry.set(channelUrl, exp);
           }
           persistCache();
         }
         return result;
       })
-      .catch(() => {
+      .catch((err) => {
         pendingCache.delete(primaryKey);
+        if (err.name === 'AbortError') {
+          throw err;
+        }
         return '__ERROR__';
       });
 
-    pendingCache.set(primaryKey, promise);
+    pendingObj.promise = promise;
+    pendingCache.set(primaryKey, pendingObj);
     return promise;
-  };
-
-  /**
-   * Renders subscriber count or private status onto badge.
-   * @param {HTMLElement} badge
-   * @param {string|null} subCount
-   */
-  const applyBadgeContent = (badge, subCount) => {
-    if (subCount === null) {
-      badge.textContent = 'Private';
-      badge.classList.add('is-private');
-    } else {
-      badge.textContent = subCount;
-      badge.classList.remove('is-private');
-    }
-    badge.classList.remove('is-loading');
   };
 
   /**
@@ -371,13 +554,9 @@
     return match ? match[1] : null;
   };
 
-  /**
-   * Updates badge DOM with subscriber count or private status.
-   * Renders synchronously without loading flicker if already in resolved cache.
-   * @param {HTMLAnchorElement} anchor
-   * @param {HTMLElement} badge
-   */
-  const updateBadge = async (anchor, badge) => {
+  const activeControllers = new WeakMap();
+
+  const updateBadge = async (anchor, badge, signal, commentElement) => {
     const targetUrl = anchor.href;
     if (!targetUrl) return;
 
@@ -388,33 +567,77 @@
     badge.dataset.target = targetUrl;
 
     // Check synchronous cache first for zero layout shift / instant render
-    if (resolvedCache.has(cacheKey) || (channelUrl && resolvedCache.has(channelUrl))) {
-      const cached = resolvedCache.get(cacheKey) ?? resolvedCache.get(channelUrl);
+    const cached = getCachedValue(cacheKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
+    if (cached !== undefined) {
       applyBadgeContent(badge, cached);
+      if (commentElement) {
+        activeControllers.delete(commentElement);
+        viewportObserver.unobserve(commentElement);
+      }
       return;
     }
 
     badge.classList.add('is-loading');
-    const subCount = await getSubs(targetUrl, browseId);
 
-    // Abort if YouTube recycled this comment element while request was pending
-    if (anchor.href !== targetUrl) return;
+    try {
+      const subCount = await getSubs(targetUrl, browseId, signal);
 
-    if (subCount === '__ERROR__') {
-      badge.classList.add('is-loading');
-      return;
+      // Abort if YouTube recycled this comment element while request was pending
+      if (anchor.href !== targetUrl) return;
+
+      if (subCount === '__ERROR__') {
+        badge.classList.add('is-loading');
+        return;
+      }
+
+      applyBadgeContent(badge, subCount);
+      if (commentElement) {
+        viewportObserver.unobserve(commentElement);
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return;
+      }
+    } finally {
+      if (commentElement && activeControllers.get(commentElement)?.signal === signal) {
+        activeControllers.delete(commentElement);
+      }
     }
+  };
 
-    applyBadgeContent(badge, subCount);
+  const applyBadgeContent = (badge, subCount) => {
+    if (subCount === null) {
+      badge.textContent = 'Private';
+      badge.classList.add('is-private');
+    } else {
+      badge.textContent = subCount;
+      badge.classList.remove('is-private');
+    }
+    badge.classList.remove('is-loading');
   };
 
   /**
-   * Finds the commenter's channel link inside the comment header.
+   * Fast author anchor validator using O(1) property checks instead of heavy CSS matches selectors.
+   * @param {HTMLAnchorElement} el
+   * @returns {boolean}
+   */
+  const isAuthorAnchor = (el) => {
+    if (!el || el.tagName !== 'A') return false;
+    const id = el.id;
+    if (id === 'author-text' || id === 'name') return true;
+    if (el.parentElement?.id === 'header-author') return true;
+    const href = el.getAttribute('href') || '';
+    return (href.startsWith('/@') || href.startsWith('/channel/')) && el.closest('div#header-author') !== null;
+  };
+
+  /**
+   * Finds the commenter's channel link inside the comment header with fast-path for author-text.
    */
   const getAuthorAnchor = (header) =>
-    header.querySelector(
-      'a#author-text, a#name, a[href^="/@"], a[href^="/channel/"]'
-    ) || header.querySelector('a');
+    header.querySelector('a#author-text') ||
+    header.querySelector('a#name') ||
+    header.querySelector('a[href^="/@"], a[href^="/channel/"]') ||
+    header.querySelector('a');
 
   /**
    * Initializes a comment element once it nears the viewport.
@@ -434,13 +657,14 @@
       const channelUrl = normalizeChannelUrl(anchor.href);
       const cacheKey = browseId || channelUrl;
 
-      if (cacheKey && (resolvedCache.has(cacheKey) || resolvedCache.has(channelUrl))) {
-        const cached = resolvedCache.get(cacheKey) ?? resolvedCache.get(channelUrl);
+      const cached = getCachedValue(cacheKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
+      if (cached !== undefined) {
         badge = document.createElement('span');
         badge.className = 'subscriber-count';
         badge.dataset.target = anchor.href;
         applyBadgeContent(badge, cached);
         header.appendChild(badge);
+        viewportObserver.unobserve(commentElement);
         return;
       }
 
@@ -449,17 +673,28 @@
       header.appendChild(badge);
     }
 
-    updateBadge(anchor, badge);
+    if (activeControllers.has(commentElement)) return;
+
+    const controller = new AbortController();
+    activeControllers.set(commentElement, controller);
+    updateBadge(anchor, badge, controller.signal, commentElement);
   };
 
-  // Viewport observer with 400px margin for pre-emptive loading before scroll-in
+  // Viewport observer with 400px margin for pre-emptive loading and viewport exit cancellation
   const viewportObserver = new IntersectionObserver(
-    (entries, observer) => {
+    (entries) => {
       for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
+        const el = entry.target;
         if (entry.isIntersecting) {
-          observer.unobserve(entry.target);
-          initComment(entry.target);
+          initComment(el);
+        } else {
+          // Element left viewport before completing: abort and clean up
+          const controller = activeControllers.get(el);
+          if (controller) {
+            controller.abort();
+            activeControllers.delete(el);
+          }
         }
       }
     },
@@ -474,7 +709,8 @@
     viewportObserver.observe(commentElement);
   };
 
-  // Single shared MutationObserver scoped strictly to the comments container.
+  // Single shared MutationObserver scoped strictly to the comments thread container.
+  // Replaces heavy CSS .matches calls with O(1) property checks.
   const commentsObserver = new MutationObserver((mutations) => {
     for (let i = 0; i < mutations.length; i++) {
       const m = mutations[i];
@@ -482,19 +718,27 @@
       // Handle element reuse / href changes (virtual DOM recycling)
       if (m.type === 'attributes' && m.attributeName === 'href') {
         const anchor = m.target;
-        if (
-          anchor &&
-          anchor.matches?.('a#author-text, a#name, a[href^="/@"], a[href^="/channel/"]')
-        ) {
-          const header = anchor.closest('div#header-author');
+        if (isAuthorAnchor(anchor)) {
+          const header =
+            anchor.parentElement?.id === 'header-author'
+              ? anchor.parentElement
+              : anchor.closest('div#header-author');
           if (header) {
+            const comment = anchor.closest('ytd-comment-view-model');
             const badge = header.querySelector('.subscriber-count');
             if (badge) {
               if (badge.dataset.target !== anchor.href) {
-                updateBadge(anchor, badge);
+                if (comment) {
+                  const ctrl = activeControllers.get(comment);
+                  if (ctrl) {
+                    ctrl.abort();
+                    activeControllers.delete(comment);
+                  }
+                  queueComment(comment);
+                  initComment(comment);
+                }
               }
             } else {
-              const comment = anchor.closest('ytd-comment-view-model');
               if (comment) queueComment(comment);
             }
           }
@@ -521,7 +765,9 @@
   });
 
   const attachCommentsObserver = () => {
+    const threadContainer = document.querySelector('ytd-comments #contents');
     const container =
+      threadContainer ||
       document.querySelector('ytd-comments') ||
       document.querySelector('#comments');
 
@@ -573,6 +819,11 @@
       pageObserver.disconnect();
       pageObserver = null;
     }
+    for (const pending of pendingCache.values()) {
+      pending.masterController?.abort();
+    }
+    pendingCache.clear();
+    requestQueue.length = 0;
     init();
   });
 })();
