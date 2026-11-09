@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Commenter Subscribers
 // @namespace    https://github.com/EndzE
-// @version      1.4.0
+// @version      1.4.6
 // @description  Displays the commenter's subscriber count next to their username on YouTube.
 // @author       EndzE
 // @license      MIT
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  console.log('[Commenter Subscribers] Initializing v1.4.0 (GM Storage 24h TTL + LIFO + AbortController)');
+  console.log('[Commenter Subscribers] Initializing v1.4.6');
 
   const css = `
     .subscriber-count {
@@ -37,7 +37,7 @@
       font-weight: 400;
       vertical-align: middle;
       user-select: none;
-      contain: layout style;
+      contain: layout style paint;
       white-space: nowrap;
     }
     html[dark] .subscriber-count,
@@ -62,8 +62,23 @@
     document.head.appendChild(style);
   }
 
-  // Regex pattern for YouTube aboutChannelViewModel subscriberCountText
-  const REGEX_SUB_TEXT = /"subscriberCountText":"([^"]+)"/;
+  // Fast string token and regex pattern for YouTube aboutChannelViewModel subscriberCountText
+  const SUB_KEY = '"subscriberCountText":"';
+
+  /**
+   * Fast SIMD-accelerated string extractor for subscriberCountText without regex engine overhead.
+   * @param {string} text
+   * @param {number} [startFrom]
+   * @returns {string|null}
+   */
+  const extractSubscriberCountFast = (text, startFrom = 0) => {
+    const idx = text.indexOf(SUB_KEY, startFrom);
+    if (idx === -1) return null;
+    const start = idx + SUB_KEY.length;
+    const end = text.indexOf('"', start);
+    return end === -1 ? null : text.slice(start, end);
+  };
+
   const SUB_LANG_REGEX =
     /subscri|suscri|subskry|abon|подпис|підпис|падпіс|абон|претплат|pretplat|iscritt|inscrit|prenumer|odběrat|odbera|tilaaj|tellij|feliratkoz|εγγεγραμμ|συνδρομητ|מנוי|登録者|구독자|订阅|訂閱|مشتر[كک]|सदस्य|গ্রাহক|ผู้ติดตาม|đăng ký|pelanggan|langganan/i;
 
@@ -74,6 +89,9 @@
   const pendingCache = new Map();
   const resolvedCache = new Map();
   const cacheExpiry = new Map();
+  const handleToCanonical = new Map();
+  let isDirty = false;
+  let saveTimer = null;
 
   // Helper to read persistent GM / localStorage
   const readPersistentStorage = () => {
@@ -104,25 +122,49 @@
     } catch {}
   };
 
-  // Safe cache accessor that verifies 24-hour TTL
+  // Safe cache accessor that verifies 24-hour TTL and resolves handle aliases
   const getCachedValue = (key) => {
-    if (!key || !resolvedCache.has(key)) return undefined;
-    const exp = cacheExpiry.get(key);
+    if (!key) return undefined;
+    const canonicalKey = handleToCanonical.get(key) || key;
+    if (!resolvedCache.has(canonicalKey)) return undefined;
+    const exp = cacheExpiry.get(canonicalKey);
     if (exp && Date.now() > exp) {
-      resolvedCache.delete(key);
-      cacheExpiry.delete(key);
+      resolvedCache.delete(canonicalKey);
+      cacheExpiry.delete(canonicalKey);
+      if (canonicalKey !== key) handleToCanonical.delete(key);
       return undefined;
     }
-    return resolvedCache.get(key);
+    return resolvedCache.get(canonicalKey);
   };
 
-  // Hydrate L1 cache from persistent GM storage with 24h TTL filtering
+  // Canonical cache setter with de-duplication and dirty-flag tracking
+  const setCachedValue = (canonicalId, channelUrl, val) => {
+    if (!val || val === '__ERROR__') return;
+    const primary = canonicalId || channelUrl;
+    if (!primary) return;
+
+    const exp = Date.now() + CACHE_TTL_MS;
+    resolvedCache.set(primary, val);
+    cacheExpiry.set(primary, exp);
+
+    if (canonicalId && channelUrl && canonicalId !== channelUrl) {
+      handleToCanonical.set(channelUrl, canonicalId);
+    }
+    persistCache();
+  };
+
+  // Hydrate L1 cache from persistent GM storage with 24h TTL filtering and alias hydration
   try {
     const now = Date.now();
     const stored = readPersistentStorage();
     if (stored && typeof stored === 'object') {
       for (const [k, item] of Object.entries(stored)) {
-        if (item && typeof item === 'object' && 'exp' in item) {
+        if (typeof item === 'string') {
+          // Pointer alias: handle -> canonical ID
+          if (item !== '__ERROR__') {
+            handleToCanonical.set(k, item);
+          }
+        } else if (item && typeof item === 'object' && 'exp' in item) {
           if (item.exp > now && item.val !== '__ERROR__') {
             resolvedCache.set(k, item.val);
             cacheExpiry.set(k, item.exp);
@@ -137,28 +179,61 @@
     sessionStorage.removeItem('yt_subscribers_cache');
   } catch {}
 
-  let saveTimer = null;
-  const persistCache = () => {
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => {
-      saveTimer = null;
-      try {
-        const now = Date.now();
-        const payload = {};
-        let count = 0;
-        for (const [k, v] of resolvedCache.entries()) {
-          if (v !== '__ERROR__') {
-            const exp = cacheExpiry.get(k) || (now + CACHE_TTL_MS);
-            if (exp > now) {
-              payload[k] = { val: v, exp };
-              if (++count >= MAX_STORAGE_ENTRIES) break;
-            }
+  // Flushes dirty cache to persistent storage (serialized only when dirty)
+  const flushStorage = () => {
+    saveTimer = null;
+    if (!isDirty) return;
+    isDirty = false;
+    try {
+      const now = Date.now();
+      const payload = {};
+      let count = 0;
+
+      // 1. Persist canonical entries first (doubles effective capacity)
+      for (const [k, v] of resolvedCache.entries()) {
+        if (v !== '__ERROR__') {
+          const exp = cacheExpiry.get(k) || (now + CACHE_TTL_MS);
+          if (exp > now) {
+            payload[k] = { val: v, exp };
+            if (++count >= MAX_STORAGE_ENTRIES) break;
           }
         }
-        writePersistentStorage(payload);
-      } catch {}
-    }, 1500);
+      }
+
+      // 2. Persist lightweight string aliases if space allows
+      if (count < MAX_STORAGE_ENTRIES) {
+        for (const [handle, canonicalId] of handleToCanonical.entries()) {
+          if (payload[canonicalId]) {
+            payload[handle] = canonicalId;
+            if (++count >= MAX_STORAGE_ENTRIES) break;
+          }
+        }
+      }
+
+      writePersistentStorage(payload);
+    } catch {}
   };
+
+  // Schedules non-blocking cache persistence during idle frames
+  const persistCache = () => {
+    isDirty = true;
+    if (saveTimer) return;
+    if (typeof requestIdleCallback === 'function') {
+      saveTimer = requestIdleCallback(flushStorage, { timeout: 3000 });
+    } else {
+      saveTimer = setTimeout(flushStorage, 1500);
+    }
+  };
+
+  // Ensure dirty cache is committed when switching tabs or unloading
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && isDirty) {
+      flushStorage();
+    }
+  });
+  window.addEventListener('pagehide', () => {
+    if (isDirty) flushStorage();
+  });
 
   // Safe InnerTube context accessor
   const getYtContext = () => {
@@ -170,8 +245,8 @@
       : { client: { clientName: 'WEB', clientVersion: '2.20261105.05.01' } };
   };
 
-  // Concurrency limiter with LIFO priority scheduling and AbortSignal support
-  const MAX_CONCURRENT = 6;
+  // Concurrency limiter with LIFO priority scheduling and HTTP/2 & HTTP/3 multiplexing
+  const MAX_CONCURRENT = 12;
   let activeRequests = 0;
   const requestQueue = [];
 
@@ -355,13 +430,13 @@
 
     if (!res.body || typeof res.body.getReader !== 'function') {
       const text = await res.text();
-      const match = text.match(REGEX_SUB_TEXT);
-      return match ? match[1] : extractFallback(text);
+      return extractSubscriberCountFast(text) || extractFallback(text);
     }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let lastScanLen = 0;
 
     while (true) {
       if (signal?.aborted) {
@@ -372,15 +447,18 @@
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      const match = buffer.match(REGEX_SUB_TEXT);
+      const searchFrom = Math.max(0, lastScanLen - SUB_KEY.length);
+      const match = extractSubscriberCountFast(buffer, searchFrom);
+      lastScanLen = buffer.length;
       if (match) {
         reader.cancel().catch(() => {});
-        return match[1];
+        return match;
       }
 
       // Keep 256KB sliding buffer to preserve pageHeaderRenderer metadata if fallback is needed
       if (buffer.length > 393216) {
         buffer = buffer.slice(-262144);
+        lastScanLen = buffer.length;
       }
     }
 
@@ -415,17 +493,22 @@
   };
 
   /**
-   * Fast channel URL & handle normalizer without URL object allocations.
+   * Fast channel URL & handle normalizer without regex allocation or split arrays.
    * @param {string} rawUrl
    * @returns {string}
    */
   const normalizeChannelUrl = (rawUrl) => {
     if (!rawUrl) return '';
-    const cleanPath = rawUrl
-      .replace(/^https?:\/\/[^/]+/, '')
-      .split(/[?#]/)[0]
-      .replace(/\/+$/, '');
-    return location.origin + cleanPath;
+    const origin = location.origin;
+    let path = rawUrl.startsWith(origin) ? rawUrl.slice(origin.length) : rawUrl.replace(/^https?:\/\/[^/]+/, '');
+    const qIdx = path.indexOf('?');
+    if (qIdx !== -1) path = path.slice(0, qIdx);
+    const hIdx = path.indexOf('#');
+    if (hIdx !== -1) path = path.slice(0, hIdx);
+    while (path.endsWith('/') && path.length > 1) {
+      path = path.slice(0, -1);
+    }
+    return origin + path;
   };
 
   /**
@@ -450,6 +533,12 @@
       if (cachedUrl !== undefined) {
         return Promise.resolve(cachedUrl);
       }
+    }
+
+    const opSub = getOpSubscriberCount(null, browseId, channelUrl);
+    if (opSub !== undefined) {
+      setCachedValue(browseId, channelUrl, opSub);
+      return Promise.resolve(opSub);
     }
 
     if (pendingCache.has(primaryKey)) {
@@ -510,14 +599,7 @@
       .then((result) => {
         pendingCache.delete(primaryKey);
         if (result !== '__ERROR__') {
-          const exp = Date.now() + CACHE_TTL_MS;
-          resolvedCache.set(primaryKey, result);
-          cacheExpiry.set(primaryKey, exp);
-          if (channelUrl && channelUrl !== primaryKey) {
-            resolvedCache.set(channelUrl, result);
-            cacheExpiry.set(channelUrl, exp);
-          }
-          persistCache();
+          setCachedValue(primaryKey, channelUrl, result);
         }
         return result;
       })
@@ -535,49 +617,87 @@
   };
 
   /**
-   * Extracts browseId from anchor data or URL.
+   * Fast channel browseId extractor with parent element reuse and zero-allocation slice parsing.
    * @param {HTMLAnchorElement} anchor
+   * @param {HTMLElement} [commentElement]
    * @returns {string|null}
    */
-  const getBrowseId = (anchor) => {
+  const getBrowseId = (anchor, commentElement) => {
     if (anchor?.data?.browseEndpoint?.browseId) {
       return anchor.data.browseEndpoint.browseId;
     }
-    const parentComment = anchor?.closest('ytd-comment-view-model');
+    const parentComment = commentElement || anchor?.closest('ytd-comment-view-model');
     if (parentComment) {
       const thumb = parentComment.querySelector('a#author-thumbnail');
       if (thumb?.data?.browseEndpoint?.browseId) {
         return thumb.data.browseEndpoint.browseId;
       }
     }
-    const match = anchor?.href?.match(/\/channel\/(UC[\w-]+)/);
-    return match ? match[1] : null;
+    const href = anchor?.href;
+    if (href) {
+      const idx = href.indexOf('/channel/UC');
+      if (idx !== -1) {
+        const end = href.indexOf('/', idx + 9);
+        return end === -1 ? href.slice(idx + 9) : href.slice(idx + 9, end);
+      }
+    }
+    return null;
   };
 
   const activeControllers = new WeakMap();
 
-  const updateBadge = async (anchor, badge, signal, commentElement) => {
+  const updateBadge = async (
+    anchor,
+    headerOrBadge,
+    signal,
+    commentElement,
+    passedBrowseId,
+    passedChannelUrl,
+    passedCacheKey
+  ) => {
     const targetUrl = anchor.href;
     if (!targetUrl) return;
 
-    const browseId = getBrowseId(anchor);
-    const channelUrl = normalizeChannelUrl(targetUrl);
-    const cacheKey = browseId || channelUrl;
+    const browseId = passedBrowseId !== undefined ? passedBrowseId : getBrowseId(anchor, commentElement);
+    const channelUrl = passedChannelUrl !== undefined ? passedChannelUrl : normalizeChannelUrl(targetUrl);
+    const cacheKey = passedCacheKey || browseId || channelUrl;
 
-    badge.dataset.target = targetUrl;
+    const header = headerOrBadge?.classList?.contains('subscriber-count')
+      ? (anchor.parentElement?.id === 'header-author' ? anchor.parentElement : anchor.closest('div#header-author'))
+      : headerOrBadge;
+    let badge = headerOrBadge?.classList?.contains('subscriber-count')
+      ? headerOrBadge
+      : header?.querySelector('.subscriber-count');
+
+    if (badge) {
+      badge.dataset.target = targetUrl;
+    }
 
     // Check synchronous cache first for zero layout shift / instant render
-    const cached = getCachedValue(cacheKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
+    let cached = getCachedValue(cacheKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
+    if (cached === undefined) {
+      const opSub = getOpSubscriberCount(header, browseId, channelUrl);
+      if (opSub !== undefined) {
+        cached = opSub;
+        setCachedValue(browseId, channelUrl, opSub);
+      }
+    }
     if (cached !== undefined) {
-      applyBadgeContent(badge, cached);
+      if (!badge && header) {
+        badge = document.createElement('span');
+        badge.className = 'subscriber-count';
+        header.appendChild(badge);
+      }
+      if (badge) {
+        badge.dataset.target = targetUrl;
+        applyBadgeContent(badge, cached);
+      }
       if (commentElement) {
         activeControllers.delete(commentElement);
         viewportObserver.unobserve(commentElement);
       }
       return;
     }
-
-    badge.classList.add('is-loading');
 
     try {
       const subCount = await getSubs(targetUrl, browseId, signal);
@@ -586,11 +706,21 @@
       if (anchor.href !== targetUrl) return;
 
       if (subCount === '__ERROR__') {
-        badge.classList.add('is-loading');
+        if (badge) badge.classList.add('is-loading');
         return;
       }
 
-      applyBadgeContent(badge, subCount);
+      // Deferred DOM creation: Only insert badge into DOM once count is actually ready!
+      if (!badge && header) {
+        badge = document.createElement('span');
+        badge.className = 'subscriber-count';
+        header.appendChild(badge);
+      }
+
+      if (badge) {
+        badge.dataset.target = targetUrl;
+        applyBadgeContent(badge, subCount);
+      }
       if (commentElement) {
         viewportObserver.unobserve(commentElement);
       }
@@ -631,11 +761,48 @@
   };
 
   /**
-   * Finds the commenter's channel link inside the comment header with fast-path for author-text.
+   * Fast zero-network OP (video author) subscriber count resolver from active watch page DOM.
+   * If the commenter is the video creator, extracts sub count directly from #owner-sub-count.
+   * @param {HTMLElement|null} header
+   * @param {string|null} browseId
+   * @param {string|null} channelUrl
+   * @returns {string|undefined}
+   */
+  const getOpSubscriberCount = (header, browseId, channelUrl) => {
+    const subEl = document.querySelector('#owner-sub-count');
+    const subText = subEl?.textContent?.trim();
+    if (!subText) return undefined;
+
+    // Fast path: native author badge rendered for creator comments
+    if (header?.querySelector('ytd-author-comment-badge-renderer')) {
+      return subText;
+    }
+
+    // Secondary match: against watch page video owner link or browseId
+    const ownerEl = document.querySelector('ytd-watch-metadata #owner, #upload-info #owner, ytd-video-owner-renderer');
+    if (!ownerEl) return undefined;
+
+    const ownerAnchor = ownerEl.querySelector('a[href^="/@"], a[href^="/channel/"], a#avatar, a#channel-name');
+    const ownerHref = ownerAnchor?.getAttribute('href');
+    if (ownerHref && channelUrl && normalizeChannelUrl(ownerHref) === channelUrl) {
+      return subText;
+    }
+
+    const ownerBrowseId =
+      ownerAnchor?.data?.browseEndpoint?.browseId ||
+      ownerEl.data?.navigationEndpoint?.browseEndpoint?.browseId;
+    if (ownerBrowseId && browseId && ownerBrowseId === browseId) {
+      return subText;
+    }
+
+    return undefined;
+  };
+
+  /**
+   * Finds the commenter's channel link inside the comment header with unified comma selector.
    */
   const getAuthorAnchor = (header) =>
-    header.querySelector('a#author-text') ||
-    header.querySelector('a#name') ||
+    header.querySelector('a#author-text, a#name') ||
     header.querySelector('a[href^="/@"], a[href^="/channel/"]') ||
     header.querySelector('a');
 
@@ -650,34 +817,45 @@
     const anchor = getAuthorAnchor(header);
     if (!anchor) return;
 
-    let badge = header.querySelector('.subscriber-count');
-    if (!badge) {
-      // Synchronous fast-path: if already cached, initialize badge with content immediately
-      const browseId = getBrowseId(anchor);
-      const channelUrl = normalizeChannelUrl(anchor.href);
-      const cacheKey = browseId || channelUrl;
+    const browseId = getBrowseId(anchor, commentElement);
+    const channelUrl = normalizeChannelUrl(anchor.href);
+    const cacheKey = browseId || channelUrl;
 
-      const cached = getCachedValue(cacheKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
-      if (cached !== undefined) {
+    let badge = header.querySelector('.subscriber-count');
+
+    // 1. Synchronous fast-path: if already cached or OP, initialize badge with content immediately
+    let cached = getCachedValue(cacheKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
+    if (cached === undefined) {
+      const opSub = getOpSubscriberCount(header, browseId, channelUrl);
+      if (opSub !== undefined) {
+        cached = opSub;
+        setCachedValue(browseId, channelUrl, opSub);
+      }
+    }
+
+    if (cached !== undefined) {
+      if (!badge) {
         badge = document.createElement('span');
         badge.className = 'subscriber-count';
-        badge.dataset.target = anchor.href;
-        applyBadgeContent(badge, cached);
         header.appendChild(badge);
-        viewportObserver.unobserve(commentElement);
-        return;
       }
+      badge.dataset.target = anchor.href;
+      applyBadgeContent(badge, cached);
+      viewportObserver.unobserve(commentElement);
+      return;
+    }
 
-      badge = document.createElement('span');
-      badge.className = 'subscriber-count is-loading';
-      header.appendChild(badge);
+    // 2. Uncached: Defer DOM insertion until subscriber count is resolved.
+    // If a recycled badge was present from another author, hide it until resolved.
+    if (badge) {
+      badge.classList.add('is-loading');
     }
 
     if (activeControllers.has(commentElement)) return;
 
     const controller = new AbortController();
     activeControllers.set(commentElement, controller);
-    updateBadge(anchor, badge, controller.signal, commentElement);
+    updateBadge(anchor, header, controller.signal, commentElement, browseId, channelUrl, cacheKey);
   };
 
   // Viewport observer with 400px margin for pre-emptive loading and viewport exit cancellation
