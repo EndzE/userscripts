@@ -286,7 +286,7 @@
   const normalizeChannelUrl = (rawUrl) => {
     if (!rawUrl) return '';
     const cleanPath = rawUrl
-      .replace(/^https?:\/\/[^\/]+/, '')
+      .replace(/^https?:\/\/[^/]+/, '')
       .split(/[?#]/)[0]
       .replace(/\/+$/, '');
     return location.origin + cleanPath;
