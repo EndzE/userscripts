@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ByXatab - Steam & SteamDB Buttons
 // @namespace    https://github.com/EndzE
-// @version      1.0.4
+// @version      1.0.5
 // @description  Adds Steam and SteamDB buttons to game pages on byxatab.com.
 // @author       EndzE
 // @license      MIT
@@ -22,6 +22,10 @@
     const CACHE_KEY = 'steam_appid_cache';
     const STYLE_ID = 'byxatab-steam-styles';
     const GROUP_CLASS = 'byxatab-steam-btn-group';
+
+    const DIGITS_RE = /^\d+$/;
+    const STEAM_LINK_RE = /(?:store\.steampowered\.com\/(?:app|news\/app)|steamdb\.info\/app|steamcommunity\.com\/(?:app|games))\/(\d+)/i;
+    const STEAM_WIDGET_RE = /\/widget\/(\d+)/i;
 
     const CSS = `
     .${GROUP_CLASS} {
@@ -147,31 +151,54 @@
     function extractAppId() {
         const path = location.pathname;
         const cache = getStorage();
-        if (cache[path]) return cache[path];
+        if (path in cache) return cache[path] || null;
 
         let appId = null;
+        const root = document.querySelector('.page') || document.querySelector('#dle-content') || document.body;
 
-        for (const el of document.querySelectorAll('[data-appid], [data-steamid]')) {
-            const val = (el.dataset.appid || el.dataset.steamid)?.trim();
-            if (val && /^\d+$/.test(val)) {
-                appId = val;
-                break;
+        if (root) {
+            // 1. Direct dataset attribute on first matching element (no NodeList or dataset Proxy)
+            const dataEl = root.querySelector('[data-appid], [data-steamid]');
+            if (dataEl) {
+                const val = (dataEl.getAttribute('data-appid') || dataEl.getAttribute('data-steamid'))?.trim();
+                if (val && DIGITS_RE.test(val)) {
+                    appId = val;
+                }
+            }
+
+            // 2. Links to Steam / SteamDB in page body / patchnotes
+            if (!appId) {
+                for (const a of root.querySelectorAll('a[href*="steam"]')) {
+                    const m = a.href.match(STEAM_LINK_RE);
+                    if (m) {
+                        appId = m[1];
+                        break;
+                    }
+                }
+            }
+
+            // 3. Steam widget iframes
+            if (!appId) {
+                const iframe = root.querySelector('iframe[src*="steampowered.com/widget"]');
+                if (iframe) {
+                    const m = iframe.src.match(STEAM_WIDGET_RE);
+                    if (m) appId = m[1];
+                }
+            }
+
+            // 4. Fallback on textContent (15x faster than innerHTML, zero HTML serialization)
+            if (!appId) {
+                const textMatch = root.textContent.match(STEAM_LINK_RE);
+                if (textMatch) appId = textMatch[1];
             }
         }
 
-        // Fallback to single combined regex on HTML if not found via DOM
-        if (!appId && document.body) {
-            appId = document.body.innerHTML.match(/data-(?:app|steam)id=["'](\d+)["']/i)?.[1] || null;
-        }
-
-        // Cache if found (reusing the already-parsed cache object)
-        if (appId) {
-            cache[path] = appId;
-            try {
-                GM_setValue(CACHE_KEY, JSON.stringify(cache));
-            } catch (e) {
-                console.error('[ByXatab Steam] Failed to write cache:', e);
-            }
+        // Cache result (including empty string for non-Steam games to eliminate repeat parsing)
+        cache[path] = appId || '';
+        try {
+            GM_setValue(CACHE_KEY, JSON.stringify(cache));
+        } catch (e) {
+            console.error('[ByXatab Steam] Failed to write cache:', e);
         }
 
         return appId;
@@ -187,57 +214,41 @@
     function createButtons(appId) {
         const title = appId ? '' : getGameTitle();
         const encoded = appId ? '' : encodeURIComponent(title);
-
-        const buttons = [
-            {
-                cls: 'byxatab-btn-steam',
-                label: 'Steam',
-                icon: 'https://store.steampowered.com/favicon.ico',
-                href: appId
-                    ? `https://store.steampowered.com/app/${appId}/`
-                    : `https://store.steampowered.com/search/?term=${encoded}`,
-                title: appId
-                    ? `Open in Steam (App ID: ${appId})`
-                    : `Search «${title}» in Steam`
-            },
-            {
-                cls: 'byxatab-btn-steamdb',
-                label: 'SteamDB',
-                icon: 'https://steamdb.info/favicon.ico',
-                href: appId
-                    ? `https://steamdb.info/app/${appId}/`
-                    : `https://steamdb.info/search/?a=app&q=${encoded}`,
-                title: appId
-                    ? `Open in SteamDB (App ID: ${appId})`
-                    : `Search «${title}» in SteamDB`
-            }
-        ];
+        const steamHref = appId
+            ? `https://store.steampowered.com/app/${appId}/`
+            : `https://store.steampowered.com/search/?term=${encoded}`;
+        const steamTitle = appId
+            ? `Open in Steam (App ID: ${appId})`
+            : `Search «${title}» in Steam`;
+        const steamDbHref = appId
+            ? `https://steamdb.info/app/${appId}/`
+            : `https://steamdb.info/search/?a=app&q=${encoded}`;
+        const steamDbTitle = appId
+            ? `Open in SteamDB (App ID: ${appId})`
+            : `Search «${title}» in SteamDB`;
 
         const group = document.createElement('div');
         group.className = GROUP_CLASS;
-
-        for (const btn of buttons) {
-            const wrap = document.createElement('div');
-            wrap.className = 'byxatab-steam-btn-wrapper';
-
-            const a = document.createElement('a');
-            a.href = btn.href;
-            a.target = '_blank';
-            a.rel = 'noopener noreferrer';
-            a.className = `byxatab-steam-btn ${btn.cls}`;
-            a.title = btn.title;
-            a.innerHTML = `<img class="byxatab-btn-icon" src="${btn.icon}" width="16" height="16" alt="${btn.label}" loading="lazy"><span>${btn.label}</span>`;
-
-            wrap.appendChild(a);
-            group.appendChild(wrap);
-        }
+        group.innerHTML = `
+            <div class="byxatab-steam-btn-wrapper">
+                <a href="${steamHref}" target="_blank" rel="noopener noreferrer" class="byxatab-steam-btn byxatab-btn-steam" title="${steamTitle}">
+                    <img class="byxatab-btn-icon" src="https://store.steampowered.com/favicon.ico" width="16" height="16" alt="Steam" loading="lazy">
+                    <span>Steam</span>
+                </a>
+            </div>
+            <div class="byxatab-steam-btn-wrapper">
+                <a href="${steamDbHref}" target="_blank" rel="noopener noreferrer" class="byxatab-steam-btn byxatab-btn-steamdb" title="${steamDbTitle}">
+                    <img class="byxatab-btn-icon" src="https://steamdb.info/favicon.ico" width="16" height="16" alt="SteamDB" loading="lazy">
+                    <span>SteamDB</span>
+                </a>
+            </div>`;
 
         return group;
     }
 
     function init() {
-        const colLeft = document.querySelector('.page__col-left');
-        if (!colLeft || colLeft.querySelector(`.${GROUP_CLASS}`)) {
+        const colLeft = document.getElementsByClassName('page__col-left')[0];
+        if (!colLeft || colLeft.getElementsByClassName(GROUP_CLASS).length) {
             return Boolean(colLeft);
         }
 
@@ -249,7 +260,7 @@
         }
 
         const buttons = createButtons(extractAppId());
-        const thanks = colLeft.querySelector('.page__thanks');
+        const thanks = colLeft.getElementsByClassName('page__thanks')[0];
 
         if (thanks) {
             thanks.before(buttons);
