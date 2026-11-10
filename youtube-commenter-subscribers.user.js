@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Commenter Subscribers
 // @namespace    https://github.com/EndzE
-// @version      1.5.12
+// @version      1.5.18
 // @description  Displays the commenter's subscriber count next to their username on YouTube.
 // @author       EndzE
 // @license      MIT
@@ -23,7 +23,7 @@
   'use strict';
 
   const DEBUG = false;
-  const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '1.5.12';
+  const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '1.5.18';
   if (DEBUG) console.log(`[Commenter Subscribers] Initializing v${version}`);
 
   const css = `
@@ -106,22 +106,17 @@
   const ERROR_TTL_MS = 60 * 1000; // 1 minute negative cache for errors
   const MAX_STORAGE_ENTRIES = 1000;
   const pendingCache = new Map();
-  const resolvedCache = new Map();
-  const cacheExpiry = new Map();
-  const handleToCanonical = new Map();
+  const storageCache = new Map();
   let isDirty = false;
   let saveTimer = null;
-  let isIdleTimer = false;
 
   // Helper to read persistent GM / localStorage
   const readPersistentStorage = () => {
     try {
       if (typeof GM_getValue === 'function') {
         const val = GM_getValue(STORAGE_KEY, null);
-        if (val) return typeof val === 'string' ? JSON.parse(val) : val;
+        return typeof val === 'string' ? JSON.parse(val) : val;
       }
-    } catch {}
-    try {
       const raw = localStorage.getItem(STORAGE_KEY);
       return raw ? JSON.parse(raw) : null;
     } catch {
@@ -134,57 +129,44 @@
     try {
       if (typeof GM_setValue === 'function') {
         GM_setValue(STORAGE_KEY, payload);
-        return;
+      } else {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
       }
-    } catch {}
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch {}
   };
 
-  // Safe cache accessor that verifies TTL and resolves handle aliases
+  // Safe cache accessor that verifies TTL
   const getCachedValue = (key) => {
     if (!key) return undefined;
-    const canonicalKey = handleToCanonical.get(key) || key;
-    if (!resolvedCache.has(canonicalKey)) return undefined;
-    const exp = cacheExpiry.get(canonicalKey);
-    if (exp && Date.now() > exp) {
-      resolvedCache.delete(canonicalKey);
-      cacheExpiry.delete(canonicalKey);
-      if (canonicalKey !== key) handleToCanonical.delete(key);
+    const entry = storageCache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.exp) {
+      storageCache.delete(key);
       return undefined;
     }
-    return resolvedCache.get(canonicalKey);
+    return entry.val;
   };
 
-  // Canonical cache setter with LRU refresh, size capping and dirty-flag tracking
+  // Cache setter with LRU refresh, size capping and dirty-flag tracking
   const setCachedValue = (canonicalId, channelUrl, val, customTtl) => {
     if (val === undefined) return;
-    const primary = canonicalId || channelUrl;
-    if (!primary) return;
-
     const ttl = val === ERROR ? ERROR_TTL_MS : (customTtl || CACHE_TTL_MS);
     const exp = Date.now() + ttl;
+    const entry = { val, exp };
 
-    // Refresh LRU order: delete then set
-    resolvedCache.delete(primary);
-    resolvedCache.set(primary, val);
-    cacheExpiry.set(primary, exp);
-
-    // Evict oldest in-memory entries if exceeding bounds
-    if (resolvedCache.size > MAX_STORAGE_ENTRIES * 1.5) {
-      const oldestKey = resolvedCache.keys().next().value;
-      resolvedCache.delete(oldestKey);
-      cacheExpiry.delete(oldestKey);
+    if (canonicalId) {
+      storageCache.delete(canonicalId);
+      storageCache.set(canonicalId, entry);
+    }
+    if (channelUrl && channelUrl !== canonicalId) {
+      storageCache.delete(channelUrl);
+      storageCache.set(channelUrl, entry);
     }
 
-    if (canonicalId && channelUrl && canonicalId !== channelUrl) {
-      handleToCanonical.delete(channelUrl);
-      handleToCanonical.set(channelUrl, canonicalId);
-      if (handleToCanonical.size > MAX_STORAGE_ENTRIES * 1.5) {
-        const oldestHandle = handleToCanonical.keys().next().value;
-        handleToCanonical.delete(oldestHandle);
-      }
+    // Evict oldest in-memory entries if exceeding bounds (capped at MAX_STORAGE_ENTRIES * 2 for dual keys)
+    while (storageCache.size > MAX_STORAGE_ENTRIES * 2) {
+      const oldestKey = storageCache.keys().next().value;
+      storageCache.delete(oldestKey);
     }
 
     if (val !== ERROR) {
@@ -192,39 +174,29 @@
     }
   };
 
-  // Hydrate L1 cache from persistent GM storage with TTL filtering and alias hydration
+  // Hydrate L1 cache from persistent storage with TTL filtering and backward-compatible migration
   try {
     const now = Date.now();
     const stored = readPersistentStorage();
     if (stored && typeof stored === 'object') {
       for (const [k, item] of Object.entries(stored)) {
-        if (typeof item === 'string') {
-          if (item !== ERROR) {
-            handleToCanonical.set(k, item);
-          }
-        } else if (item && typeof item === 'object' && 'exp' in item) {
-          if (item.exp > now && item.val !== ERROR) {
-            resolvedCache.set(k, item.val);
-            cacheExpiry.set(k, item.exp);
-          }
-        } else if (item !== ERROR) {
-          resolvedCache.set(k, item);
-          cacheExpiry.set(k, now + CACHE_TTL_MS);
+        if (item && typeof item === 'object' && item.exp > now && item.val !== ERROR) {
+          storageCache.set(k, item);
+        }
+      }
+      // Migrate legacy string aliases from previous schema
+      for (const [k, item] of Object.entries(stored)) {
+        if (typeof item === 'string' && storageCache.has(item)) {
+          storageCache.set(k, storageCache.get(item));
         }
       }
     }
-    sessionStorage.removeItem('yt_subscribers_cache');
   } catch {}
 
   const cancelSaveTimer = () => {
     if (saveTimer !== null) {
-      if (isIdleTimer && typeof cancelIdleCallback === 'function') {
-        cancelIdleCallback(saveTimer);
-      } else {
-        clearTimeout(saveTimer);
-      }
+      clearTimeout(saveTimer);
       saveTimer = null;
-      isIdleTimer = false;
     }
   };
 
@@ -236,69 +208,35 @@
     try {
       const now = Date.now();
       const stored = readPersistentStorage() || {};
-      const mergedCanonical = new Map();
-      const mergedAliases = new Map();
+      const merged = new Map();
 
-      // 1. Hydrate existing stored entries
+      // 1. Merge existing valid storage entries
       for (const [k, item] of Object.entries(stored)) {
-        if (typeof item === 'string') {
-          if (item !== ERROR) mergedAliases.set(k, item);
-        } else if (item && typeof item === 'object' && 'exp' in item) {
-          if (item.exp > now && item.val !== ERROR) {
-            mergedCanonical.set(k, item);
-          }
+        if (item && typeof item === 'object' && item.exp > now && item.val !== ERROR) {
+          merged.set(k, item);
         }
       }
 
-      // 2. Merge current tab's resolved cache (overriding if newer)
-      for (const [k, v] of resolvedCache.entries()) {
-        if (v !== ERROR) {
-          const exp = cacheExpiry.get(k) || (now + CACHE_TTL_MS);
-          if (exp > now) {
-            mergedCanonical.delete(k); // Move to back for LRU
-            mergedCanonical.set(k, { val: v, exp });
-          }
+      // 2. Merge current tab's cache (overriding if newer and refreshing LRU order)
+      for (const [k, entry] of storageCache.entries()) {
+        if (entry.exp > now && entry.val !== ERROR) {
+          merged.delete(k);
+          merged.set(k, entry);
         }
       }
 
-      for (const [h, c] of handleToCanonical.entries()) {
-        if (mergedCanonical.has(c)) {
-          mergedAliases.delete(h);
-          mergedAliases.set(h, c);
-        }
-      }
-
-      // 3. Keep newest entries up to MAX_STORAGE_ENTRIES
-      const canonicalEntries = Array.from(mergedCanonical.entries());
-      const keptCanonical = canonicalEntries.slice(-MAX_STORAGE_ENTRIES);
-
-      const payload = {};
-      for (const [k, v] of keptCanonical) {
-        payload[k] = v;
-      }
-
-      // 4. Preserve aliases for kept canonical entries (capped independently up to MAX_STORAGE_ENTRIES)
-      const aliasEntries = Array.from(mergedAliases.entries());
-      const validAliases = aliasEntries.filter(([, c]) => payload[c] !== undefined);
-      for (const [h, c] of validAliases.slice(-MAX_STORAGE_ENTRIES)) {
-        payload[h] = c;
-      }
-
+      // 3. Keep newest entries up to MAX_STORAGE_ENTRIES * 2
+      const entries = Array.from(merged.entries()).slice(-MAX_STORAGE_ENTRIES * 2);
+      const payload = Object.fromEntries(entries);
       writePersistentStorage(payload);
     } catch {}
   };
 
-  // Schedules non-blocking cache persistence during idle frames
+  // Schedules non-blocking cache persistence via debounce timer
   const persistCache = () => {
     isDirty = true;
     if (saveTimer !== null) return;
-    if (typeof requestIdleCallback === 'function') {
-      isIdleTimer = true;
-      saveTimer = requestIdleCallback(flushStorage, { timeout: 3000 });
-    } else {
-      isIdleTimer = false;
-      saveTimer = setTimeout(flushStorage, 1500);
-    }
+    saveTimer = setTimeout(flushStorage, 2000);
   };
 
   // Ensure dirty cache is committed when switching tabs or unloading
@@ -345,7 +283,6 @@
 
     while (activeRequests < MAX_CONCURRENT && requestQueue.length > 0) {
       const item = requestQueue.shift();
-      if (item.signal?.aborted) continue;
       activeRequests++;
       item.run().finally(() => {
         activeRequests--;
@@ -358,31 +295,26 @@
     if (signal?.aborted) {
       return Promise.reject(new DOMException('Aborted', 'AbortError'));
     }
-
     return new Promise((resolve, reject) => {
       let item;
       const onAbort = () => {
         const idx = requestQueue.indexOf(item);
-        if (idx !== -1) {
-          requestQueue.splice(idx, 1);
-        }
+        if (idx !== -1) requestQueue.splice(idx, 1);
         reject(new DOMException('Aborted', 'AbortError'));
       };
-
       item = {
         run: () => {
-          if (signal?.aborted) {
-            onAbort();
-            return Promise.resolve(); // Resolves internal queue runner without unhandled rejection
-          }
           signal?.removeEventListener('abort', onAbort);
-          return task().then(resolve, reject);
+          try {
+            return task().then(resolve, reject);
+          } catch (err) {
+            reject(err);
+            return Promise.resolve();
+          }
         },
-        signal,
       };
-
       signal?.addEventListener('abort', onAbort, { once: true });
-      requestQueue.unshift(item);
+      requestQueue.unshift(item); // LIFO: prioritize currently visible comments
       runQueue();
     });
   };
@@ -494,15 +426,13 @@
   /**
    * Fetches subscriber count using InnerTube API browse endpoint with request hints.
    * @param {string} browseId
-   * @param {AbortSignal} [signal]
    * @returns {Promise<string>}
    */
-  const fetchInnerTube = async (browseId, signal) => {
+  const fetchInnerTube = async (browseId) => {
     const res = await fetch('/youtubei/v1/browse?prettyPrint=false', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ context: getYtContext(), browseId }),
-      signal,
       priority: 'low',
     });
     if (!res.ok) {
@@ -518,11 +448,10 @@
   /**
    * Fetches subscriber count using ReadableStream early exit as safety fallback.
    * @param {string} channelUrl
-   * @param {AbortSignal} [signal]
    * @returns {Promise<string|null>}
    */
-  const fetchSubscriberCountStream = async (channelUrl, signal) => {
-    const res = await fetch(`${channelUrl}/about`, { signal, priority: 'low' });
+  const fetchSubscriberCountStream = async (channelUrl) => {
+    const res = await fetch(`${channelUrl}/about`, { priority: 'low' });
     if (!res.ok) {
       if (res.status === 429 || res.status >= 500) {
         cooldownUntil = Date.now() + 30000;
@@ -542,10 +471,6 @@
     let savedHeaderSlice = null;
 
     while (true) {
-      if (signal?.aborted) {
-        reader.cancel().catch(() => {});
-        throw new DOMException('Aborted', 'AbortError');
-      }
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -585,28 +510,21 @@
    * Unified fetch dispatcher: attempts InnerTube browse first, falls back to stream.
    * @param {string|null} browseId
    * @param {string} channelUrl
-   * @param {AbortSignal} [signal]
    * @returns {Promise<string>}
    */
-  const fetchSubscriberCount = async (browseId, channelUrl, signal) => {
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  const fetchSubscriberCount = async (browseId, channelUrl) => {
     try {
       if (browseId) {
-        return await fetchInnerTube(browseId, signal);
+        return await fetchInnerTube(browseId);
       }
-      const streamRes = await fetchSubscriberCountStream(channelUrl, signal);
+      const streamRes = await fetchSubscriberCountStream(channelUrl);
       return streamRes ?? PRIVATE;
     } catch (err) {
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      if (err.name === 'AbortError') throw err;
       if (browseId && channelUrl) {
         try {
-          const fallbackRes = await fetchSubscriberCountStream(channelUrl, signal);
+          const fallbackRes = await fetchSubscriberCountStream(channelUrl);
           return fallbackRes ?? PRIVATE;
-        } catch (e) {
-          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-          if (e.name === 'AbortError') throw e;
-        }
+        } catch {}
       }
       if (DEBUG) console.warn('[Commenter Subscribers] Fetch failed for:', channelUrl || browseId, err);
       return ERROR;
@@ -643,52 +561,8 @@
   };
 
   /**
-   * Attaches an individual caller's AbortSignal to a shared promise with reference-counted cancellation.
-   * @param {Promise} promise
-   * @param {AbortSignal} [signal]
-   * @param {object} pending
-   * @returns {Promise}
-   */
-  const attachCallerSignal = (promise, signal, pending) => {
-    if (!signal) return promise;
-    if (signal.aborted) {
-      return Promise.reject(new DOMException('Aborted', 'AbortError'));
-    }
-
-    return new Promise((resolve, reject) => {
-      const onAbort = () => {
-        cleanup();
-        pending.signals.delete(signal);
-        if (pending.signals.size === 0 && pending.hasSignalListeners) {
-          pending.masterController.abort();
-        }
-        reject(new DOMException('Aborted', 'AbortError'));
-      };
-
-      const cleanup = () => {
-        signal.removeEventListener('abort', onAbort);
-      };
-
-      signal.addEventListener('abort', onAbort, { once: true });
-      pending.signals.add(signal);
-      pending.hasSignalListeners = true;
-
-      promise.then(
-        (val) => {
-          cleanup();
-          resolve(val);
-        },
-        (err) => {
-          cleanup();
-          reject(err);
-        }
-      );
-    });
-  };
-
-  /**
    * Normalizes channel target and manages queued fetching with multi-tier caching.
-   * Supports multi-signal reference-counted cancellation.
+   * In-flight requests are shared across callers and populate cache on completion.
    * @param {string} rawUrl
    * @param {string|null} browseId
    * @param {AbortSignal} [signal]
@@ -716,47 +590,37 @@
       return Promise.resolve(opSub);
     }
 
+    // If already in-flight on the network, share the promise
     if (pendingCache.has(primaryKey)) {
-      const pending = pendingCache.get(primaryKey);
-      if (!pending.masterController.signal.aborted) {
-        return attachCallerSignal(pending.promise, signal, pending);
+      return pendingCache.get(primaryKey);
+    }
+
+    // Wait for an active slot in the LIFO queue (cancellable while waiting)
+    return enqueueRequest(() => {
+      // Re-check cache / in-flight when finally starting
+      const reCached = getCachedValue(primaryKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
+      if (reCached !== undefined) return Promise.resolve(reCached);
+
+      if (pendingCache.has(primaryKey)) {
+        return pendingCache.get(primaryKey);
       }
-      pendingCache.delete(primaryKey);
-    }
 
-    if (signal?.aborted) {
-      return Promise.reject(new DOMException('Aborted', 'AbortError'));
-    }
+      const inFlight = fetchSubscriberCount(browseId, channelUrl)
+        .then((result) => {
+          setCachedValue(primaryKey, channelUrl, result);
+          return result;
+        })
+        .catch(() => {
+          setCachedValue(primaryKey, channelUrl, ERROR);
+          return ERROR;
+        })
+        .finally(() => {
+          pendingCache.delete(primaryKey);
+        });
 
-    const masterController = new AbortController();
-    const pendingObj = {
-      masterController,
-      signals: new Set(),
-      hasSignalListeners: false,
-      promise: null,
-    };
-
-    const promise = enqueueRequest(
-      () => fetchSubscriberCount(browseId, channelUrl, masterController.signal),
-      masterController.signal
-    )
-      .then((result) => {
-        pendingCache.delete(primaryKey);
-        setCachedValue(primaryKey, channelUrl, result);
-        return result;
-      })
-      .catch((err) => {
-        pendingCache.delete(primaryKey);
-        if (err.name === 'AbortError') {
-          throw err;
-        }
-        setCachedValue(primaryKey, channelUrl, ERROR);
-        return ERROR;
-      });
-
-    pendingObj.promise = promise;
-    pendingCache.set(primaryKey, pendingObj);
-    return attachCallerSignal(promise, signal, pendingObj);
+      pendingCache.set(primaryKey, inFlight);
+      return inFlight;
+    }, signal);
   };
 
   /**
@@ -845,7 +709,7 @@
       applyBadgeContent(badge, subCount);
 
       if (commentElement) {
-        viewportObserver.unobserve(commentElement);
+        unobserveComment(commentElement);
       }
     } catch (err) {
       if (err.name === 'AbortError') return;
@@ -936,16 +800,35 @@
     header.querySelector('a[href^="/@"], a[href^="/channel/"]') ||
     header.querySelector('a');
 
+  let observedComments = new WeakSet();
+
+  const unobserveComment = (el) => {
+    if (!el) return;
+    observedComments.delete(el);
+    viewportObserver.unobserve(el);
+  };
+
+  const resetViewportObserver = () => {
+    observedComments = new WeakSet();
+    viewportObserver.disconnect();
+  };
+
   /**
    * Initializes a comment element once it nears the viewport.
    * @param {HTMLElement} commentElement
    */
   const initComment = (commentElement) => {
     const header = commentElement.querySelector('div#header-author');
-    if (!header) return;
+    if (!header) {
+      unobserveComment(commentElement);
+      return;
+    }
 
     const anchor = getAuthorAnchor(header);
-    if (!anchor) return;
+    if (!anchor) {
+      unobserveComment(commentElement);
+      return;
+    }
 
     const browseId = getBrowseId(anchor, commentElement);
     const channelUrl = normalizeChannelUrl(anchor.href);
@@ -956,7 +839,7 @@
       const badge = ensureBadge(header);
       badge.dataset.target = targetUrl;
       applyBadgeContent(badge, cached);
-      viewportObserver.unobserve(commentElement);
+      unobserveComment(commentElement);
       return;
     }
 
@@ -970,6 +853,11 @@
     const controller = new AbortController();
     activeControllers.set(commentElement, controller);
     updateBadge(anchor, header, controller.signal, commentElement, browseId);
+  };
+
+  const isCommentResolved = (commentElement) => {
+    const badge = commentElement.querySelector('.subscriber-count');
+    return badge !== null && !badge.classList.contains('is-loading');
   };
 
   // Viewport observer with 400px margin for pre-emptive loading and viewport exit cancellation
@@ -992,9 +880,18 @@
     { rootMargin: '400px 0px' }
   );
 
-  const queueComment = (commentElement) => {
+  const queueComment = (commentElement, force = false) => {
     if (!commentElement) return;
-    viewportObserver.unobserve(commentElement);
+
+    if (!force) {
+      if (observedComments.has(commentElement)) return;
+      if (activeControllers.has(commentElement)) return;
+      if (isCommentResolved(commentElement)) return;
+    } else {
+      unobserveComment(commentElement);
+    }
+
+    observedComments.add(commentElement);
     viewportObserver.observe(commentElement);
   };
 
@@ -1023,7 +920,7 @@
               if (badge && badge.dataset.target !== anchor.href) {
                 badge.classList.add('is-loading');
               }
-              queueComment(comment);
+              queueComment(comment, true);
             }
           }
         }
@@ -1131,7 +1028,7 @@
         attachCommentsObserver(panel);
       } else {
         commentsObserver.disconnect();
-        viewportObserver.disconnect();
+        resetViewportObserver();
       }
     };
 
@@ -1188,7 +1085,7 @@
   // Clean SPA navigation handling with complete observer teardown
   window.addEventListener('yt-navigate-finish', () => {
     commentsObserver.disconnect();
-    viewportObserver.disconnect();
+    resetViewportObserver();
     if (pageObserver) {
       pageObserver.disconnect();
       pageObserver = null;
@@ -1204,9 +1101,6 @@
     if (cooldownTimer) {
       clearTimeout(cooldownTimer);
       cooldownTimer = null;
-    }
-    for (const pending of pendingCache.values()) {
-      pending.masterController?.abort();
     }
     pendingCache.clear();
     requestQueue.length = 0;
