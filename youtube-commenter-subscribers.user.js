@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Commenter Subscribers
 // @namespace    https://github.com/EndzE
-// @version      1.5.0
+// @version      1.5.12
 // @description  Displays the commenter's subscriber count next to their username on YouTube.
 // @author       EndzE
 // @license      MIT
@@ -23,30 +23,24 @@
   'use strict';
 
   const DEBUG = false;
-  const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '1.5.0';
+  const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '1.5.12';
   if (DEBUG) console.log(`[Commenter Subscribers] Initializing v${version}`);
 
   const css = `
     .subscriber-count {
       font-size: 1.1rem;
       line-height: normal;
-      color: var(--yt-spec-text-primary, #0f0f0f);
-      background-color: var(--yt-spec-badge-chip-background, rgba(0, 0, 0, 0.06));
-      margin-left: 6px;
-      padding: 1px 4px;
-      border-radius: 4px;
-      display: inline-flex;
-      align-items: center;
-      font-weight: 400;
-      vertical-align: middle;
-      user-select: none;
-      contain: layout style paint;
+      color: #0f0f0f;
+      background-color: rgba(0, 0, 0, 0.06);
+      margin-left: 4px;
+      padding: 1px 3px;
+      border-radius: 3px;
       white-space: nowrap;
     }
     html[dark] .subscriber-count,
     [dark] .subscriber-count {
-      color: var(--yt-spec-text-primary, #f1f1f1);
-      background-color: var(--yt-spec-badge-chip-background, rgba(255, 255, 255, 0.12));
+      color: #ddd;
+      background-color: #333;
     }
     .subscriber-count.is-private {
       opacity: 0.75;
@@ -73,6 +67,20 @@
   const SUB_KEY = '"subscriberCountText":"';
 
   /**
+   * Safely unescapes raw JSON strings (handling unicode escapes like \u00a0, quotes, etc.).
+   * @param {string} raw
+   * @returns {string}
+   */
+  const unescapeJsonString = (raw) => {
+    if (!raw) return '';
+    try {
+      return JSON.parse('"' + raw + '"');
+    } catch {
+      return raw;
+    }
+  };
+
+  /**
    * Fast string extractor for subscriberCountText with JSON escape unescaping.
    * @param {string} text
    * @param {number} [startFrom]
@@ -84,12 +92,7 @@
     const start = idx + SUB_KEY.length;
     const end = text.indexOf('"', start);
     if (end === -1) return null;
-    const raw = text.slice(start, end);
-    try {
-      return JSON.parse('"' + raw + '"');
-    } catch {
-      return raw;
-    }
+    return unescapeJsonString(text.slice(start, end));
   };
 
   const SUB_LANG_REGEX =
@@ -108,6 +111,7 @@
   const handleToCanonical = new Map();
   let isDirty = false;
   let saveTimer = null;
+  let isIdleTimer = false;
 
   // Helper to read persistent GM / localStorage
   const readPersistentStorage = () => {
@@ -212,9 +216,21 @@
     sessionStorage.removeItem('yt_subscribers_cache');
   } catch {}
 
+  const cancelSaveTimer = () => {
+    if (saveTimer !== null) {
+      if (isIdleTimer && typeof cancelIdleCallback === 'function') {
+        cancelIdleCallback(saveTimer);
+      } else {
+        clearTimeout(saveTimer);
+      }
+      saveTimer = null;
+      isIdleTimer = false;
+    }
+  };
+
   // Flushes dirty cache to persistent storage, merging with latest storage to prevent cross-tab overwrite
   const flushStorage = () => {
-    saveTimer = null;
+    cancelSaveTimer();
     if (!isDirty) return;
     isDirty = false;
     try {
@@ -261,12 +277,11 @@
         payload[k] = v;
       }
 
-      let remainingSlots = MAX_STORAGE_ENTRIES - keptCanonical.length;
-      if (remainingSlots > 0) {
-        const aliasEntries = Array.from(mergedAliases.entries());
-        for (const [h, c] of aliasEntries.slice(-remainingSlots)) {
-          if (payload[c]) payload[h] = c;
-        }
+      // 4. Preserve aliases for kept canonical entries (capped independently up to MAX_STORAGE_ENTRIES)
+      const aliasEntries = Array.from(mergedAliases.entries());
+      const validAliases = aliasEntries.filter(([, c]) => payload[c] !== undefined);
+      for (const [h, c] of validAliases.slice(-MAX_STORAGE_ENTRIES)) {
+        payload[h] = c;
       }
 
       writePersistentStorage(payload);
@@ -276,10 +291,12 @@
   // Schedules non-blocking cache persistence during idle frames
   const persistCache = () => {
     isDirty = true;
-    if (saveTimer) return;
+    if (saveTimer !== null) return;
     if (typeof requestIdleCallback === 'function') {
+      isIdleTimer = true;
       saveTimer = requestIdleCallback(flushStorage, { timeout: 3000 });
     } else {
+      isIdleTimer = false;
       saveTimer = setTimeout(flushStorage, 1500);
     }
   };
@@ -308,12 +325,22 @@
   let activeRequests = 0;
   const requestQueue = [];
   let cooldownUntil = 0;
+  let cooldownTimer = null;
 
   const runQueue = () => {
     const now = Date.now();
     if (now < cooldownUntil) {
-      setTimeout(runQueue, Math.max(100, cooldownUntil - now));
+      if (!cooldownTimer) {
+        cooldownTimer = setTimeout(() => {
+          cooldownTimer = null;
+          runQueue();
+        }, Math.max(100, cooldownUntil - now));
+      }
       return;
+    }
+    if (cooldownTimer) {
+      clearTimeout(cooldownTimer);
+      cooldownTimer = null;
     }
 
     while (activeRequests < MAX_CONCURRENT && requestQueue.length > 0) {
@@ -366,6 +393,7 @@
    * @returns {string|null}
    */
   const extractFallback = (text) => {
+    if (!text) return null;
     const marker = '"pageHeaderRenderer":';
     const start = text.indexOf(marker);
     if (start === -1) return null;
@@ -374,8 +402,8 @@
     FALLBACK_REGEX.lastIndex = 0;
     let m;
     while ((m = FALLBACK_REGEX.exec(headerSlice)) !== null) {
-      const content = m[1];
-      const label = m[2];
+      const content = unescapeJsonString(m[1]);
+      const label = unescapeJsonString(m[2]);
       if (
         content &&
         !content.startsWith('@') &&
@@ -511,6 +539,7 @@
     const decoder = new TextDecoder();
     let buffer = '';
     let lastScanLen = 0;
+    let savedHeaderSlice = null;
 
     while (true) {
       if (signal?.aborted) {
@@ -529,14 +558,27 @@
         return match;
       }
 
-      // Keep 256KB sliding buffer to preserve pageHeaderRenderer metadata if fallback is needed
+      // Early fallback check and header slice preservation
+      const headerIdx = buffer.indexOf('"pageHeaderRenderer":');
+      if (headerIdx !== -1) {
+        if (!savedHeaderSlice && buffer.length >= headerIdx + 3500) {
+          savedHeaderSlice = buffer.slice(headerIdx, headerIdx + 3500);
+          const fallbackMatch = extractFallback(savedHeaderSlice);
+          if (fallbackMatch) {
+            reader.cancel().catch(() => {});
+            return fallbackMatch;
+          }
+        }
+      }
+
+      // Keep 256KB sliding buffer to preserve trailing metadata if fallback is needed
       if (buffer.length > 393216) {
         buffer = buffer.slice(-262144);
         lastScanLen = buffer.length;
       }
     }
 
-    return extractFallback(buffer);
+    return extractFallback(buffer) || (savedHeaderSlice ? extractFallback(savedHeaderSlice) : null);
   };
 
   /**
@@ -547,6 +589,7 @@
    * @returns {Promise<string>}
    */
   const fetchSubscriberCount = async (browseId, channelUrl, signal) => {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     try {
       if (browseId) {
         return await fetchInnerTube(browseId, signal);
@@ -554,12 +597,14 @@
       const streamRes = await fetchSubscriberCountStream(channelUrl, signal);
       return streamRes ?? PRIVATE;
     } catch (err) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (err.name === 'AbortError') throw err;
-      if (browseId && channelUrl && !signal?.aborted) {
+      if (browseId && channelUrl) {
         try {
           const fallbackRes = await fetchSubscriberCountStream(channelUrl, signal);
           return fallbackRes ?? PRIVATE;
         } catch (e) {
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
           if (e.name === 'AbortError') throw e;
         }
       }
@@ -598,6 +643,50 @@
   };
 
   /**
+   * Attaches an individual caller's AbortSignal to a shared promise with reference-counted cancellation.
+   * @param {Promise} promise
+   * @param {AbortSignal} [signal]
+   * @param {object} pending
+   * @returns {Promise}
+   */
+  const attachCallerSignal = (promise, signal, pending) => {
+    if (!signal) return promise;
+    if (signal.aborted) {
+      return Promise.reject(new DOMException('Aborted', 'AbortError'));
+    }
+
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        cleanup();
+        pending.signals.delete(signal);
+        if (pending.signals.size === 0 && pending.hasSignalListeners) {
+          pending.masterController.abort();
+        }
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+
+      const cleanup = () => {
+        signal.removeEventListener('abort', onAbort);
+      };
+
+      signal.addEventListener('abort', onAbort, { once: true });
+      pending.signals.add(signal);
+      pending.hasSignalListeners = true;
+
+      promise.then(
+        (val) => {
+          cleanup();
+          resolve(val);
+        },
+        (err) => {
+          cleanup();
+          reject(err);
+        }
+      );
+    });
+  };
+
+  /**
    * Normalizes channel target and manages queued fetching with multi-tier caching.
    * Supports multi-signal reference-counted cancellation.
    * @param {string} rawUrl
@@ -630,56 +719,22 @@
     if (pendingCache.has(primaryKey)) {
       const pending = pendingCache.get(primaryKey);
       if (!pending.masterController.signal.aborted) {
-        if (signal) {
-          if (signal.aborted) {
-            return Promise.reject(new DOMException('Aborted', 'AbortError'));
-          }
-          const onAbort = () => {
-            pending.signals.delete(signal);
-            if (pending.signals.size === 0 && pending.hasSignalListeners) {
-              pending.masterController.abort();
-            }
-          };
-          pending.signals.add(signal);
-          pending.hasSignalListeners = true;
-          signal.addEventListener('abort', onAbort, { once: true });
-          return pending.promise.finally(() => {
-            signal.removeEventListener('abort', onAbort);
-          });
-        }
-        return pending.promise;
+        return attachCallerSignal(pending.promise, signal, pending);
       }
       pendingCache.delete(primaryKey);
     }
 
-    const masterController = new AbortController();
-    const signals = new Set();
-    let hasSignalListeners = false;
-
-    if (signal) {
-      if (signal.aborted) {
-        return Promise.reject(new DOMException('Aborted', 'AbortError'));
-      }
-      signals.add(signal);
-      hasSignalListeners = true;
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('Aborted', 'AbortError'));
     }
 
+    const masterController = new AbortController();
     const pendingObj = {
       masterController,
-      signals,
-      hasSignalListeners,
+      signals: new Set(),
+      hasSignalListeners: false,
       promise: null,
     };
-
-    if (signal) {
-      const onAbort = () => {
-        signals.delete(signal);
-        if (signals.size === 0 && pendingObj.hasSignalListeners) {
-          masterController.abort();
-        }
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
 
     const promise = enqueueRequest(
       () => fetchSubscriberCount(browseId, channelUrl, masterController.signal),
@@ -701,7 +756,7 @@
 
     pendingObj.promise = promise;
     pendingCache.set(primaryKey, pendingObj);
-    return promise;
+    return attachCallerSignal(promise, signal, pendingObj);
   };
 
   /**
@@ -747,13 +802,12 @@
   };
 
   const applyBadgeContent = (badge, subCount) => {
-    if (subCount === PRIVATE || subCount === null) {
-      badge.textContent = 'Private';
-      badge.classList.add('is-private');
-    } else {
-      badge.textContent = subCount;
-      badge.classList.remove('is-private');
+    const isPrivate = subCount === PRIVATE || subCount === null;
+    const nextText = isPrivate ? 'Private' : subCount;
+    if (badge.textContent !== nextText) {
+      badge.textContent = nextText;
     }
+    badge.classList.toggle('is-private', isPrivate);
     badge.classList.remove('is-loading');
   };
 
@@ -777,6 +831,7 @@
     try {
       const subCount = await getSubs(targetUrl, browseId, signal);
 
+      if (signal?.aborted) return;
       if (anchor.href !== targetUrl) return;
 
       if (subCount === ERROR) {
@@ -821,12 +876,24 @@
   let cachedOpInfo = null;
 
   const resolveOpInfo = () => {
+    if (isShorts()) return null;
+
+    const currentVideoId = new URLSearchParams(location.search).get('v');
+    if (currentVideoId) {
+      const metaVideoId =
+        document.querySelector('ytd-watch-metadata')?.getAttribute('video-id') ||
+        document.querySelector('ytd-watch-flexy')?.getAttribute('video-id');
+      if (metaVideoId && metaVideoId !== currentVideoId) {
+        return null;
+      }
+    }
+
     const subEl = document.querySelector('#owner-sub-count');
     const subText = subEl?.textContent?.trim();
     if (!subText) return null;
 
-    const ownerEl = document.querySelector('ytd-watch-metadata #owner, #upload-info #owner, ytd-video-owner-renderer');
-    const ownerAnchor = ownerEl?.querySelector('a[href^="/@"], a[href^="/channel/"], a#avatar, a#channel-name');
+    const ownerEl = document.querySelector('ytd-watch-metadata #owner, ytd-video-owner-renderer');
+    const ownerAnchor = ownerEl?.querySelector('a.yt-simple-endpoint[href^="/@"], a.yt-simple-endpoint[href^="/channel/"], a[href^="/@"], a[href^="/channel/"]');
     const ownerHref = ownerAnchor?.getAttribute('href');
     const ownerUrl = ownerHref ? normalizeChannelUrl(ownerHref) : null;
     const ownerBrowseId =
@@ -846,13 +913,16 @@
     const op = cachedOpInfo || resolveOpInfo();
     if (!op?.subText) return undefined;
 
+    const matchesUrl = channelUrl && op.ownerUrl && channelUrl === op.ownerUrl;
+    const matchesBrowseId = browseId && op.ownerBrowseId && browseId === op.ownerBrowseId;
+
     if (header?.querySelector('ytd-author-comment-badge-renderer')) {
-      return op.subText;
+      if (matchesUrl || matchesBrowseId || (!op.ownerUrl && !op.ownerBrowseId)) {
+        return op.subText;
+      }
+      return undefined;
     }
-    if (browseId && op.ownerBrowseId && browseId === op.ownerBrowseId) {
-      return op.subText;
-    }
-    if (channelUrl && op.ownerUrl && channelUrl === op.ownerUrl) {
+    if (matchesBrowseId || matchesUrl) {
       return op.subText;
     }
     return undefined;
@@ -924,6 +994,7 @@
 
   const queueComment = (commentElement) => {
     if (!commentElement) return;
+    viewportObserver.unobserve(commentElement);
     viewportObserver.observe(commentElement);
   };
 
@@ -964,6 +1035,7 @@
       for (let j = 0; j < added.length; j++) {
         const node = added[j];
         if (node.nodeType !== 1) continue;
+        if (node.classList.contains('subscriber-count')) continue;
 
         if (node.tagName === 'YTD-COMMENT-VIEW-MODEL') {
           queueComment(node);
@@ -975,10 +1047,23 @@
         }
       }
 
-      if (m.target.nodeType === 1) {
-        const parentComment = m.target.tagName === 'YTD-COMMENT-VIEW-MODEL'
-          ? m.target
-          : m.target.closest('ytd-comment-view-model');
+      // Ignore mutations originating from or directly adding the badge itself
+      if (
+        m.target.nodeType === 1 &&
+        !m.target.classList.contains('subscriber-count')
+      ) {
+        if (
+          m.addedNodes.length === 1 &&
+          m.addedNodes[0].nodeType === 1 &&
+          m.addedNodes[0].classList.contains('subscriber-count')
+        ) {
+          continue;
+        }
+
+        const parentComment =
+          m.target.tagName === 'YTD-COMMENT-VIEW-MODEL'
+            ? m.target
+            : m.target.closest('ytd-comment-view-model');
         if (parentComment) {
           queueComment(parentComment);
         }
@@ -994,19 +1079,18 @@
   const attachCommentsObserver = (panelTarget) => {
     let threadContainer = null;
     if (panelTarget) {
-      threadContainer = panelTarget.querySelector('ytd-comments #contents') || panelTarget.querySelector('#contents');
+      threadContainer = panelTarget.querySelector('ytd-comments') || panelTarget;
     } else {
       const panel = isShorts() ? getShortsCommentsPanel() : null;
       if (panel) {
         if (panel.getAttribute('visibility') !== 'ENGAGEMENT_PANEL_VISIBILITY_EXPANDED') {
           return false;
         }
-        threadContainer = panel.querySelector('ytd-comments #contents') || panel.querySelector('#contents');
+        threadContainer = panel.querySelector('ytd-comments') || panel;
       } else {
         threadContainer =
-          document.querySelector('ytd-comments #contents') ||
-          document.querySelector('ytd-comments:not([hidden])') ||
-          document.querySelector('#comments:not([hidden])');
+          document.querySelector('ytd-comments') ||
+          document.querySelector('#comments');
       }
     }
 
@@ -1063,7 +1147,6 @@
 
   const init = () => {
     cachedOpInfo = null;
-    resolveOpInfo();
 
     if (!isCommentsRoute()) return;
 
@@ -1117,6 +1200,10 @@
     if (rafId) {
       cancelAnimationFrame(rafId);
       rafId = null;
+    }
+    if (cooldownTimer) {
+      clearTimeout(cooldownTimer);
+      cooldownTimer = null;
     }
     for (const pending of pendingCache.values()) {
       pending.masterController?.abort();
