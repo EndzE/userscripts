@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Commenter Subscribers
 // @namespace    https://github.com/EndzE
-// @version      1.5.18
+// @version      1.5.24
 // @description  Displays the commenter's subscriber count next to their username on YouTube.
 // @author       EndzE
 // @license      MIT
@@ -23,7 +23,7 @@
   'use strict';
 
   const DEBUG = false;
-  const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '1.5.18';
+  const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '1.5.24';
   if (DEBUG) console.log(`[Commenter Subscribers] Initializing v${version}`);
 
   const css = `
@@ -96,7 +96,7 @@
   };
 
   const SUB_LANG_REGEX =
-    /subscri|suscri|subskry|abon|подпис|підпис|падпіс|абон|претплат|pretplat|iscritt|inscrit|prenumer|odběrat|odbera|tilaaj|tellij|feliratkoz|εγγεγραμμ|συνδρομητ|מנוי|登録者|구독자|订阅|訂閱|مشتر[كک]|सदस्य|গ্রাহক|ผู้ติดตาม|đăng ký|pelanggan|langganan/i;
+    /subscri|suscri|subskry|abon|подпис|підпис|падпіс|абон|претплат|pretplat|iscritt|inscrit|prenumer|odběrat|odbera|tilaaj|tellij|feliratkoz|εγγεγραμμ|συνδρομητ|מנוי|登録者|구독자|订阅|訂閱|مشتر[كک]|सदस्य|গ্রাহক|ผู้ติดตาม|đăng ký|pelanggan|langganan|naroč|abunə|გამომწერ|բաժանորդ|سبسکرائبر|жазылу|захиалагч|tagasubaybay/i;
 
   const FALLBACK_REGEX = /"text":\{"content":"([^"]+)"\},"accessibilityLabel":"([^"]*)"/g;
 
@@ -149,7 +149,7 @@
 
   // Cache setter with LRU refresh, size capping and dirty-flag tracking
   const setCachedValue = (canonicalId, channelUrl, val, customTtl) => {
-    if (val === undefined) return;
+    if (val === undefined || (!canonicalId && !channelUrl)) return;
     const ttl = val === ERROR ? ERROR_TTL_MS : (customTtl || CACHE_TTL_MS);
     const exp = Date.now() + ttl;
     const entry = { val, exp };
@@ -306,7 +306,8 @@
         run: () => {
           signal?.removeEventListener('abort', onAbort);
           try {
-            return task().then(resolve, reject);
+            const p = task(resolve, reject);
+            return p ? p.then(resolve, reject) : Promise.resolve();
           } catch (err) {
             reject(err);
             return Promise.resolve();
@@ -388,7 +389,10 @@
           const text = parts[j]?.text?.content;
           if (text && !text.startsWith('@')) {
             const label = parts[j]?.accessibilityLabel || '';
-            if (SUB_LANG_REGEX.test(`${text} ${label}`)) {
+            if (
+              SUB_LANG_REGEX.test(`${text} ${label}`) ||
+              (i === 1 && j === 0 && /\d/.test(text) && !/video|videó|vidéo|видео|vídeo|bideo|videolar|videod|videot|videi|videok|فيديو|ویڈیو|वीडियो|ভিডিও|วีดีโอ|비디오|動画|视频|影片/i.test(`${text} ${label}`))
+            ) {
               return text;
             }
           }
@@ -489,10 +493,8 @@
         if (!savedHeaderSlice && buffer.length >= headerIdx + 3500) {
           savedHeaderSlice = buffer.slice(headerIdx, headerIdx + 3500);
           const fallbackMatch = extractFallback(savedHeaderSlice);
-          if (fallbackMatch) {
-            reader.cancel().catch(() => {});
-            return fallbackMatch;
-          }
+          reader.cancel().catch(() => {});
+          return fallbackMatch;
         }
       }
 
@@ -503,7 +505,7 @@
       }
     }
 
-    return extractFallback(buffer) || (savedHeaderSlice ? extractFallback(savedHeaderSlice) : null);
+    return extractFallback(buffer);
   };
 
   /**
@@ -596,13 +598,17 @@
     }
 
     // Wait for an active slot in the LIFO queue (cancellable while waiting)
-    return enqueueRequest(() => {
+    return enqueueRequest((resolve, reject) => {
       // Re-check cache / in-flight when finally starting
       const reCached = getCachedValue(primaryKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
-      if (reCached !== undefined) return Promise.resolve(reCached);
+      if (reCached !== undefined) {
+        resolve(reCached);
+        return Promise.resolve();
+      }
 
       if (pendingCache.has(primaryKey)) {
-        return pendingCache.get(primaryKey);
+        pendingCache.get(primaryKey).then(resolve, reject);
+        return Promise.resolve();
       }
 
       const inFlight = fetchSubscriberCount(browseId, channelUrl)
@@ -615,11 +621,13 @@
           return ERROR;
         })
         .finally(() => {
-          pendingCache.delete(primaryKey);
+          if (pendingCache.get(primaryKey) === inFlight) {
+            pendingCache.delete(primaryKey);
+          }
         });
 
       pendingCache.set(primaryKey, inFlight);
-      return inFlight;
+      return inFlight.then(resolve, reject);
     }, signal);
   };
 
@@ -654,6 +662,7 @@
   };
 
   const activeControllers = new WeakMap();
+  const activeControllerSet = new Set();
 
   const ensureBadge = (header) => {
     let badge = header.querySelector('.subscriber-count');
@@ -688,7 +697,7 @@
     return cached;
   };
 
-  const updateBadge = async (anchor, header, signal, commentElement, browseId) => {
+  const updateBadge = async (anchor, header, signal, commentElement, browseId, controller) => {
     const targetUrl = anchor.href;
     if (!targetUrl) return;
 
@@ -714,8 +723,11 @@
     } catch (err) {
       if (err.name === 'AbortError') return;
     } finally {
-      if (commentElement && activeControllers.get(commentElement)?.signal === signal) {
+      if (commentElement && activeControllers.get(commentElement) === controller) {
         activeControllers.delete(commentElement);
+      }
+      if (controller) {
+        activeControllerSet.delete(controller);
       }
     }
   };
@@ -740,7 +752,10 @@
   let cachedOpInfo = null;
 
   const resolveOpInfo = () => {
-    if (isShorts()) return null;
+    if (isShorts()) {
+      cachedOpInfo = { subText: null, ownerUrl: null, ownerBrowseId: null };
+      return cachedOpInfo;
+    }
 
     const currentVideoId = new URLSearchParams(location.search).get('v');
     if (currentVideoId) {
@@ -752,18 +767,28 @@
       }
     }
 
-    const subEl = document.querySelector('#owner-sub-count');
-    const subText = subEl?.textContent?.trim();
-    if (!subText) return null;
-
     const ownerEl = document.querySelector('ytd-watch-metadata #owner, ytd-video-owner-renderer');
-    const ownerAnchor = ownerEl?.querySelector('a.yt-simple-endpoint[href^="/@"], a.yt-simple-endpoint[href^="/channel/"], a[href^="/@"], a[href^="/channel/"]');
+    const subEl = ownerEl?.querySelector('#owner-sub-count');
+    const subText = subEl?.textContent?.trim();
+    if (!subText) {
+      if (ownerEl?.querySelector('a[href^="/@"], a[href^="/channel/"]')) {
+        cachedOpInfo = { subText: null, ownerUrl: null, ownerBrowseId: null };
+        return cachedOpInfo;
+      }
+      return null;
+    }
+
+    const ownerAnchor = ownerEl?.querySelector(
+      'a.yt-simple-endpoint[href^="/@"], a.yt-simple-endpoint[href^="/channel/"], a[href^="/@"], a[href^="/channel/"]'
+    );
     const ownerHref = ownerAnchor?.getAttribute('href');
     const ownerUrl = ownerHref ? normalizeChannelUrl(ownerHref) : null;
     const ownerBrowseId =
       ownerAnchor?.data?.browseEndpoint?.browseId ||
       ownerAnchor?.wrappedJSObject?.data?.browseEndpoint?.browseId ||
       ownerEl?.data?.navigationEndpoint?.browseEndpoint?.browseId;
+
+    if (!ownerUrl && !ownerBrowseId) return null;
 
     cachedOpInfo = {
       subText,
@@ -780,7 +805,7 @@
     const matchesUrl = channelUrl && op.ownerUrl && channelUrl === op.ownerUrl;
     const matchesBrowseId = browseId && op.ownerBrowseId && browseId === op.ownerBrowseId;
 
-    if (header?.querySelector('ytd-author-comment-badge-renderer')) {
+    if (header?.querySelector('span#author-comment-badge:not([hidden]) ytd-author-comment-badge-renderer')) {
       if (matchesUrl || matchesBrowseId || (!op.ownerUrl && !op.ownerBrowseId)) {
         return op.subText;
       }
@@ -796,6 +821,9 @@
    * Finds the commenter's channel link inside the comment header.
    */
   const getAuthorAnchor = (header) =>
+    header.querySelector(
+      'a#author-text:not([hidden]), span#author-comment-badge:not([hidden]) a#name, a#name:not([hidden])'
+    ) ||
     header.querySelector('a#author-text, a#name') ||
     header.querySelector('a[href^="/@"], a[href^="/channel/"]') ||
     header.querySelector('a');
@@ -809,6 +837,10 @@
   };
 
   const resetViewportObserver = () => {
+    for (const ctrl of activeControllerSet) {
+      ctrl.abort();
+    }
+    activeControllerSet.clear();
     observedComments = new WeakSet();
     viewportObserver.disconnect();
   };
@@ -835,10 +867,15 @@
     const targetUrl = anchor.href;
 
     const cached = resolveSync(browseId, channelUrl, header);
-    if (cached !== undefined && cached !== ERROR) {
-      const badge = ensureBadge(header);
-      badge.dataset.target = targetUrl;
-      applyBadgeContent(badge, cached);
+    if (cached !== undefined) {
+      if (cached !== ERROR) {
+        const badge = ensureBadge(header);
+        badge.dataset.target = targetUrl;
+        applyBadgeContent(badge, cached);
+      } else {
+        const badge = header.querySelector('.subscriber-count');
+        if (badge) badge.classList.add('is-loading');
+      }
       unobserveComment(commentElement);
       return;
     }
@@ -852,12 +889,16 @@
 
     const controller = new AbortController();
     activeControllers.set(commentElement, controller);
-    updateBadge(anchor, header, controller.signal, commentElement, browseId);
+    activeControllerSet.add(controller);
+    updateBadge(anchor, header, controller.signal, commentElement, browseId, controller);
   };
 
   const isCommentResolved = (commentElement) => {
-    const badge = commentElement.querySelector('.subscriber-count');
-    return badge !== null && !badge.classList.contains('is-loading');
+    const header = commentElement.querySelector('div#header-author');
+    const badge = header?.querySelector('.subscriber-count');
+    if (!badge || badge.classList.contains('is-loading')) return false;
+    const anchor = getAuthorAnchor(header);
+    return Boolean(anchor?.href && badge.dataset.target === anchor.href);
   };
 
   // Viewport observer with 400px margin for pre-emptive loading and viewport exit cancellation
@@ -873,6 +914,7 @@
           if (controller) {
             controller.abort();
             activeControllers.delete(el);
+            activeControllerSet.delete(controller);
           }
         }
       }
@@ -915,6 +957,7 @@
               if (ctrl) {
                 ctrl.abort();
                 activeControllers.delete(comment);
+                activeControllerSet.delete(ctrl);
               }
               const badge = header.querySelector('.subscriber-count');
               if (badge && badge.dataset.target !== anchor.href) {
@@ -943,6 +986,8 @@
           }
         }
       }
+
+      if (m.addedNodes.length > 0) continue;
 
       // Ignore mutations originating from or directly adding the badge itself
       if (
@@ -1102,7 +1147,6 @@
       clearTimeout(cooldownTimer);
       cooldownTimer = null;
     }
-    pendingCache.clear();
     requestQueue.length = 0;
     init();
   });
