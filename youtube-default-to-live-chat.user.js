@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Default To Live Chat
 // @namespace    https://github.com/EndzE
-// @version      1.5.1
+// @version      1.5.2
 // @description  Automatically switches YouTube chat from Top Chat to Live Chat, with minimal CPU usage.
 // @author       EndzE
 // @license      MIT
@@ -21,9 +21,11 @@
 
     const POLL_INTERVAL_MS = 250;
     const MAX_DURATION_MS = 15000;
+    const LIVE_CHAT_REGEX = /live\s*chat/i;
 
     let pollTimer = null;
     let stopTimer = null;
+    let lastSwitchedDoc = null;
 
     function cleanup() {
         if (pollTimer) {
@@ -38,7 +40,11 @@
 
     function isWatchPage() {
         const path = window.location.pathname;
-        return path.startsWith('/watch') || path.startsWith('/live');
+        return (
+            path.startsWith('/watch') ||
+            path.startsWith('/live') || // Covers /live/... and popout /live_chat
+            path.endsWith('/live')      // Covers /@channel/live, /c/channel/live, etc.
+        );
     }
 
     function isLiveChatSelected(anchor) {
@@ -65,7 +71,8 @@
         if (!iframe || iframe.__defaultLiveChatHooked) return;
         iframe.__defaultLiveChatHooked = true;
         iframe.addEventListener('load', () => {
-            start();
+            lastSwitchedDoc = null;
+            start(true);
         });
     }
 
@@ -78,7 +85,8 @@
         attachIframeListener();
 
         const chatDoc = getChatDoc();
-        if (!chatDoc) return;
+        // Skip if chatDoc is missing or is the stale document from a previous video
+        if (!chatDoc || chatDoc === lastSwitchedDoc) return;
 
         let docHref = '';
         try {
@@ -95,44 +103,42 @@
         const items = subMenu.querySelectorAll('tp-yt-paper-listbox > a.yt-simple-endpoint');
         if (items.length < 2) return;
 
-        const liveChatAnchor = Array.from(items).find(a => /live\s*chat/i.test(a.textContent)) || items[1];
+        const liveChatAnchor = Array.from(items).find(a => LIVE_CHAT_REGEX.test(a.textContent)) || items[1];
         if (!liveChatAnchor) return;
 
-        // If already on Live Chat, stop immediately
         if (isLiveChatSelected(liveChatAnchor)) {
+            lastSwitchedDoc = chatDoc;
             cleanup();
             return;
         }
 
-        // Click the item directly without opening the dropdown button first.
-        // The DOM nodes already exist inside the closed dropdown, so this switches
-        // chat modes silently without a visual menu flash or a 250ms render delay.
         const clickTarget = liveChatAnchor.querySelector('tp-yt-paper-item') || liveChatAnchor;
         clickTarget.click();
 
-        // If Polymer updated the selection state synchronously, clean up now;
-        // otherwise, the next poll tick will verify the switch and clean up.
         if (isLiveChatSelected(liveChatAnchor)) {
+            lastSwitchedDoc = chatDoc;
             cleanup();
         }
     }
 
-    function start() {
+    function start(force = false) {
         if (!isWatchPage()) {
             cleanup();
             return;
         }
 
+        if (force) {
+            lastSwitchedDoc = null;
+        }
+
         cleanup();
         pollTimer = setInterval(poll, POLL_INTERVAL_MS);
-        poll(); // Try immediately
+        poll();
 
-        stopTimer = setTimeout(() => {
-            cleanup();
-        }, MAX_DURATION_MS);
+        stopTimer = setTimeout(cleanup, MAX_DURATION_MS);
     }
 
     start();
-    window.addEventListener('yt-navigate-finish', start);
-    window.addEventListener('yt-page-data-updated', start);
+    window.addEventListener('yt-navigate-finish', () => start(false));
+    window.addEventListener('yt-page-data-updated', () => start(false));
 })();
