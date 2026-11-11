@@ -1,15 +1,14 @@
 // ==UserScript==
 // @name         Givee.Club - Card Dimmer
 // @namespace    https://github.com/EndzE
-// @version      1.3.0
+// @version      1.3.1
 // @description  Adds top-right icon on a game card to dim/undim it. Dimmed cards are saved in storage across reloads.
 // @author       EndzE
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=givee.club
 // @homepageURL  https://github.com/EndzE/userscripts
 // @supportURL   https://github.com/EndzE/userscripts/issues
-// @match        *://givee.club/*
-// @match        *://*.givee.club/*
+// @match        https://givee.club/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
