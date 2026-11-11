@@ -10,6 +10,12 @@ Adds Steam, Epic Games, and GOG buttons to game pages on [byxatab.com](https://b
 - **File:** [`byxatab-store-buttons.user.js`](byxatab-store-buttons.user.js)
 - **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/byxatab-store-buttons.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/604250-byxatab-store-buttons)
 
+### Givee.Club - Card Dimmer
+Adds a top-right toggle button on game cards to dim or undim them, preserving hidden cards across reloads and syncing in real time across open tabs.
+
+- **File:** [`givee-club-card-dimmer.user.js`](givee-club-card-dimmer.user.js)
+- **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/givee-club-card-dimmer.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/604854-givee-club-card-dimmer)
+
 ### YouTube - Commenter Subscribers
 Displays the commenter's subscriber count next to their username on YouTube.
 
