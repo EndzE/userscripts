@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Livechat GoToChannel
 // @namespace    https://github.com/EndzE
-// @version      1.0.10
+// @version      1.0.13
 // @description  Restores the "Go to channel" option in YouTube live chat with instant context menus, hover prefetching, and debounce bypass.
 // @author       EndzE
 // @license      MIT
@@ -355,6 +355,98 @@
         applyFlagsHooks(win);
     }
 
+    function disableWholeItemContextMenu(win) {
+        function injectCursorStyles() {
+            const doc = win.document;
+            if (!doc || doc.getElementById('yt-chat-cursor-fix')) return;
+            const style = doc.createElement('style');
+            style.id = 'yt-chat-cursor-fix';
+            style.textContent = `
+                yt-live-chat-text-message-renderer[whole-message-clickable],
+                yt-live-chat-paid-message-renderer[whole-message-clickable],
+                yt-live-chat-membership-item-renderer[whole-message-clickable],
+                yt-live-chat-paid-sticker-renderer[whole-message-clickable] {
+                    cursor: default !important;
+                }
+                yt-live-chat-text-message-renderer #message,
+                yt-live-chat-paid-message-renderer #message {
+                    cursor: text;
+                }
+                yt-live-chat-text-message-renderer #message a,
+                yt-live-chat-paid-message-renderer #message a,
+                yt-live-chat-text-message-renderer #menu-button,
+                yt-live-chat-paid-message-renderer #menu-button {
+                    cursor: pointer !important;
+                }
+            `;
+            (doc.head || doc.documentElement)?.appendChild(style);
+        }
+
+        function patchControllerProto(pc) {
+            if (!pc) return;
+            const proto = Object.getPrototypeOf(pc);
+            if (!proto || proto._ytChatPatched) return;
+            proto._ytChatPatched = true;
+
+            if (typeof proto.shouldSupportWholeItemClick === 'function') {
+                proto.shouldSupportWholeItemClick = function () {
+                    return false;
+                };
+            }
+
+            if (typeof proto.computeWholeMessageClickable === 'function') {
+                proto.computeWholeMessageClickable = function () {
+                    return null;
+                };
+            }
+
+            if (typeof proto.showContextMenu === 'function') {
+                const origShow = proto.showContextMenu;
+                proto.showContextMenu = function (e) {
+                    if (e && e.target) {
+                        const isFromMenu = e.composedPath ?
+                            e.composedPath().some(el => el.id === 'menu-button' || el.id === 'menu') :
+                            !!e.target.closest?.('#menu-button, #menu');
+                        if (!isFromMenu) return;
+                    }
+                    return origShow.apply(this, arguments);
+                };
+            }
+        }
+
+        if (win.customElements && typeof win.customElements.define === 'function') {
+            const origDefine = win.customElements.define;
+            win.customElements.define = function (name, constructor) {
+                if (typeof name === 'string' && name.startsWith('yt-live-chat-') && constructor?.prototype) {
+                    const origConnected = constructor.prototype.connectedCallback;
+                    constructor.prototype.connectedCallback = function () {
+                        const res = origConnected?.apply(this, arguments);
+                        const pc = this.inst || this.polymerController;
+                        if (pc) patchControllerProto(pc);
+                        return res;
+                    };
+                }
+                return origDefine.apply(this, arguments);
+            };
+        }
+
+        const patchAll = () => {
+            injectCursorStyles();
+            win.document?.querySelectorAll?.('*').forEach(el => {
+                if (el.tagName?.startsWith('YT-LIVE-CHAT-') && el.polymerController) {
+                    patchControllerProto(el.polymerController);
+                }
+            });
+        };
+
+        if (win.document?.readyState === 'loading') {
+            win.document.addEventListener('DOMContentLoaded', patchAll, { once: true });
+        } else {
+            patchAll();
+        }
+        injectCursorStyles();
+    }
+
     function initHoverPrefetch(win) {
         if (win._ytChatHoverPrefetchAttached) return;
         win._ytChatHoverPrefetchAttached = true;
@@ -454,6 +546,7 @@
 
         initNetworkInterceptor(win);
         disableContextMenuDebounce(win);
+        disableWholeItemContextMenu(win);
         initHoverPrefetch(win);
     }
 
