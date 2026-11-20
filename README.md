@@ -28,6 +28,12 @@ Automatically switches YouTube chat from Top Chat to Live Chat, with minimal CPU
 - **File:** [`youtube-default-to-live-chat.user.js`](youtube-default-to-live-chat.user.js)
 - **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/youtube-default-to-live-chat.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/604260-youtube-default-to-live-chat)
 
+### YouTube - Flashbang Defender
+Protects your eyes by automatically detecting and dampening sudden blinding white frames, flares, and flashbang transitions in YouTube videos using real-time WebGL processing.
+
+- **File:** [`youtube-flashbang-defender.user.js`](youtube-flashbang-defender.user.js)
+- **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/youtube-flashbang-defender.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/606437-youtube-flashbang-defender)
+
 ### YouTube - Livechat GoToChannel
 Restores the "Go to channel" option in YouTube live chat with instant context menus, hover prefetching, and debounce bypass.
 
