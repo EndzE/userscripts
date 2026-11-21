@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Flashbang Defender
 // @namespace    https://github.com/EndzE
-// @version      1.4.0
+// @version      1.5.0
 // @description  Your favourite creators don't care about your eyes opening fully white pages in their videos? Care about your eyes yourself with Flashbang Defender.
 // @author       EndzE
 // @license      MIT
@@ -961,7 +961,7 @@ void main() {
     border-radius: 20px;
     border: none;
     background-color: var(--yt-spec-badge-chip-background, rgba(255, 255, 255, 0.1));
-    color: var(--yt-spec-text-primary, currentColor);
+    color: var(--yt-spec-text-primary, #f1f1f1);
     cursor: pointer;
     padding: 0;
     margin: 0;
@@ -987,7 +987,7 @@ void main() {
 }
 #yt-flashbang-defender-tooltip {
     position: absolute;
-    bottom: calc(100% + 10px);
+    top: calc(100% + 10px);
     left: 50%;
     transform: translateX(-50%);
     background-color: rgba(97, 97, 97, 0.95);
@@ -1009,6 +1009,24 @@ void main() {
 #yt-flashbang-defender-wrapper:hover:not([data-popup-open="true"]) #yt-flashbang-defender-tooltip {
     opacity: 1;
     visibility: visible;
+}
+#yt-flashbang-defender-wrapper[data-layout="shorts"] {
+    margin: 0 0 16px 0;
+    width: 48px;
+    height: 48px;
+    justify-content: center;
+}
+#yt-flashbang-defender-wrapper[data-layout="shorts"] #yt-flashbang-defender-btn {
+    width: 48px;
+    height: 48px;
+    border-radius: 24px;
+    color: #f1f1f1;
+}
+#yt-flashbang-defender-wrapper[data-layout="shorts"] #yt-fbd-green-dot {
+    top: 8px;
+    right: 8px;
+    width: 6px;
+    height: 6px;
 }
 #yt-flashbang-defender-popup {
     position: fixed;
@@ -1512,6 +1530,10 @@ void main() {
         return location.pathname.startsWith("/shorts/");
     }
 
+    function isButtonPage() {
+        return isWatchPage() || isShortsPage();
+    }
+
     function isVideoVisibleInDom(v) {
         return Boolean(v && v.isConnected && !v.closest("[hidden]"));
     }
@@ -1527,6 +1549,8 @@ void main() {
         if (isShortsPage()) {
             const sv = findVisibleVideoById("shorts-player");
             if (sv) return sv;
+            const activeShortV = document.querySelector("ytd-reel-video-renderer[is-active] video.html5-main-video");
+            if (isVideoVisibleInDom(activeShortV)) return activeShortV;
             const mini = document.querySelector("ytd-miniplayer[active] video.html5-main-video");
             if (isVideoVisibleInDom(mini)) return mini;
             return findVisibleVideoById("movie_player");
@@ -1617,6 +1641,9 @@ void main() {
     }
 
     function onVideoPlay() {
+        if (isButtonPage() && (!wrapperEl || !wrapperEl.isConnected || wrapperEl.closest("[hidden]"))) {
+            ensureMountedWithRetry(6, 100);
+        }
         if (isEnabled && currentMode === "auto" && activeVideo && !webglFailed && !isContextLost) {
             lastFrameTime = 0;
             scheduleNextFrame(activeVideo);
@@ -1649,6 +1676,9 @@ void main() {
     }
 
     function onVideoLoadedData() {
+        if (isButtonPage() && (!wrapperEl || !wrapperEl.isConnected || wrapperEl.closest("[hidden]"))) {
+            ensureMountedWithRetry(6, 100);
+        }
         if (isEnabled && currentMode === "auto" && activeVideo && !webglFailed && !isContextLost) {
             layoutDirty = true;
             if (activeVideo.paused && activeVideo.readyState >= 2) {
@@ -2165,8 +2195,8 @@ void main() {
         if (isPopupOpen) closePopup(false);
     }
 
-    // --- Watch Page Button Mounting ---
-    function findLikeDislikeContainer() {
+    // --- Watch & Shorts Page Button Mounting ---
+    function findWatchLikeDislikeContainer() {
         const topBar = document.getElementById("top-level-buttons-computed");
         if (topBar && !topBar.closest("[hidden]")) {
             const seg = topBar.querySelector(
@@ -2180,6 +2210,46 @@ void main() {
             "ytd-watch-flexy:not([hidden]) segmented-like-dislike-button-view-model, " +
             "ytd-watch-flexy:not([hidden]) ytd-segmented-like-dislike-button-renderer"
         );
+    }
+
+    function findShortsCommentsAnchor() {
+        const selectors = [
+            "ytd-reel-video-renderer[is-active] reel-action-bar-view-model > button-view-model",
+            "ytd-reel-video-renderer[is-active] #actions #comments-button",
+            "ytd-shorts:not([hidden]) reel-action-bar-view-model > button-view-model",
+            "ytd-shorts:not([hidden]) #actions #comments-button",
+            "ytd-shorts:not([hidden]) reel-action-bar-view-model > like-button-view-model",
+            "ytd-shorts:not([hidden]) #actions #like-button"
+        ];
+        for (let i = 0; i < selectors.length; i++) {
+            const el = document.querySelector(selectors[i]);
+            if (el && el.isConnected && !el.closest("[hidden]") && el.parentElement) {
+                return el;
+            }
+        }
+        return null;
+    }
+
+    function findButtonAnchor() {
+        if (isWatchPage()) {
+            const seg = findWatchLikeDislikeContainer();
+            return (seg && seg.parentElement) ? { anchor: seg, layout: "watch" } : null;
+        }
+        if (isShortsPage()) {
+            const comments = findShortsCommentsAnchor();
+            return (comments && comments.parentElement) ? { anchor: comments, layout: "shorts" } : null;
+        }
+        return null;
+    }
+
+    function placeWrapperAtTarget(target) {
+        if (!wrapperEl || !target || !target.anchor) return;
+        if (wrapperEl.dataset.layout !== target.layout) {
+            wrapperEl.dataset.layout = target.layout;
+        }
+        if (wrapperEl.previousElementSibling !== target.anchor) {
+            target.anchor.after(wrapperEl);
+        }
     }
 
     function disconnectActionBarObserver() {
@@ -2196,7 +2266,7 @@ void main() {
         disconnectActionBarObserver();
         observedActionBar = parent;
         actionBarObserver = new MutationObserver(() => {
-            if (!isWatchPage()) {
+            if (!isButtonPage()) {
                 disconnectActionBarObserver();
                 return;
             }
@@ -2204,16 +2274,16 @@ void main() {
             actionBarSyncQueued = true;
             queueMicrotask(() => {
                 actionBarSyncQueued = false;
-                if (!isWatchPage()) {
+                if (!isButtonPage()) {
                     disconnectActionBarObserver();
                     return;
                 }
                 if (!wrapperEl || !wrapperEl.isConnected) {
                     insertButton();
                 } else {
-                    const seg = findLikeDislikeContainer();
-                    if (seg && wrapperEl.previousElementSibling !== seg) {
-                        seg.after(wrapperEl);
+                    const target = findButtonAnchor();
+                    if (target) {
+                        placeWrapperAtTarget(target);
                     }
                 }
             });
@@ -2222,18 +2292,16 @@ void main() {
     }
 
     function insertButton() {
-        if (!isWatchPage()) return false;
+        if (!isButtonPage()) return false;
 
-        const segmented = findLikeDislikeContainer();
-        if (!segmented || !segmented.parentElement) return false;
+        const target = findButtonAnchor();
+        if (!target) return false;
 
         ensureStyles();
-        observeActionBar(segmented.parentElement);
+        observeActionBar(target.anchor.parentElement);
 
         if (wrapperEl && wrapperEl.isConnected) {
-            if (wrapperEl.previousElementSibling !== segmented) {
-                segmented.after(wrapperEl);
-            }
+            placeWrapperAtTarget(target);
             syncAllUI();
             return true;
         }
@@ -2242,6 +2310,7 @@ void main() {
 
         wrapperEl = document.createElement("div");
         wrapperEl.id = "yt-flashbang-defender-wrapper";
+        wrapperEl.dataset.layout = target.layout;
 
         btnEl = document.createElement("button");
         btnEl.id = "yt-flashbang-defender-btn";
@@ -2298,7 +2367,7 @@ void main() {
 
         lastBtnStateKey = "";
         updateButtonAppearance();
-        segmented.after(wrapperEl);
+        placeWrapperAtTarget(target);
         return true;
     }
 
@@ -2307,11 +2376,11 @@ void main() {
         mountRetryTimer = null;
 
         bindVideo();
-        const onWatch = isWatchPage();
-        const buttonReady = !onWatch || insertButton();
+        const needsButton = isButtonPage();
+        const buttonReady = !needsButton || insertButton();
         const videoReady = Boolean(activeVideo);
 
-        if (!onWatch && !isShortsPage() && !videoReady) {
+        if (!needsButton && !videoReady) {
             // Non-video pages (Home/Search/etc.) only need a short retry in case miniplayer mounts
             if (attemptsLeft > 2) attemptsLeft = 2;
         }
@@ -2331,12 +2400,12 @@ void main() {
 
         if (!urlChanged) {
             // Non-navigation yt-player-updated / yt-page-data-updated: skip if already cleanly mounted
-            if (isVideoVisibleInDom(activeVideo) && (!isWatchPage() || (wrapperEl && wrapperEl.isConnected))) {
+            if (isVideoVisibleInDom(activeVideo) && (!isButtonPage() || (wrapperEl && wrapperEl.isConnected && !wrapperEl.closest("[hidden]")))) {
                 return;
             }
         } else {
             closePopup(false);
-            if (!isWatchPage()) {
+            if (!isButtonPage()) {
                 disconnectActionBarObserver();
             }
             webglFailed = false;
@@ -2359,7 +2428,7 @@ void main() {
             lastFrameTime = 0;
             return;
         }
-        if (isWatchPage() && (!wrapperEl || !wrapperEl.isConnected)) {
+        if (isButtonPage() && (!wrapperEl || !wrapperEl.isConnected || wrapperEl.closest("[hidden]"))) {
             ensureMountedWithRetry(8, 200);
         }
         if (isEnabled && currentMode === "auto" && activeVideo && !webglFailed && !isContextLost) {
