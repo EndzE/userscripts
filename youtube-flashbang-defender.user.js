@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Flashbang Defender
 // @namespace    https://github.com/EndzE
-// @version      1.3.0
+// @version      1.4.0
 // @description  Your favourite creators don't care about your eyes opening fully white pages in their videos? Care about your eyes yourself with Flashbang Defender.
 // @author       EndzE
 // @license      MIT
@@ -29,15 +29,26 @@
     const STORAGE_KEY_ENABLED = "yt_flashbang_defender_enabled";
     const STORAGE_KEY_MODE = "yt_flashbang_defender_mode";
     const STORAGE_KEY_MANUAL_GAIN = "yt_flashbang_defender_manual_gain";
+    const STORAGE_KEY_AUTO_SENSITIVITY = "yt_flashbang_defender_auto_sensitivity";
 
     const MIN_MANUAL_GAIN = 0.10;
     const MAX_MANUAL_GAIN = 0.95;
     const DEFAULT_MANUAL_GAIN = 0.60;
 
+    const MIN_AUTO_SENSITIVITY = 0.00;
+    const MAX_AUTO_SENSITIVITY = 1.00;
+    const DEFAULT_AUTO_SENSITIVITY = 0.50;
+
     function clampManualGain(val) {
         const num = typeof val === "number" ? val : parseFloat(val);
         if (!Number.isFinite(num)) return DEFAULT_MANUAL_GAIN;
         return Math.min(MAX_MANUAL_GAIN, Math.max(MIN_MANUAL_GAIN, num));
+    }
+
+    function clampAutoSensitivity(val) {
+        const num = typeof val === "number" ? val : parseFloat(val);
+        if (!Number.isFinite(num)) return DEFAULT_AUTO_SENSITIVITY;
+        return Math.min(MAX_AUTO_SENSITIVITY, Math.max(MIN_AUTO_SENSITIVITY, num));
     }
 
     function readRawSetting(key, fallback) {
@@ -78,9 +89,13 @@
     const getSavedManualGain = () => clampManualGain(readRawSetting(STORAGE_KEY_MANUAL_GAIN, DEFAULT_MANUAL_GAIN));
     const saveManualGain = (val) => writeSetting(STORAGE_KEY_MANUAL_GAIN, clampManualGain(val));
 
+    const getSavedAutoSensitivity = () => clampAutoSensitivity(readRawSetting(STORAGE_KEY_AUTO_SENSITIVITY, DEFAULT_AUTO_SENSITIVITY));
+    const saveAutoSensitivity = (val) => writeSetting(STORAGE_KEY_AUTO_SENSITIVITY, clampAutoSensitivity(val));
+
     let isEnabled = getSavedEnabled();
     let currentMode = getSavedMode(); // "auto" | "manual"
     let manualGain = getSavedManualGain(); // 0.10 - 0.95
+    let autoSensitivity = getSavedAutoSensitivity(); // 0.00 - 1.00 (default 0.50)
 
     // --- WebGL2 Shaders (100% Core WebGL2, Zero Extensions, 1x1 RGBA32UI State) ---
     // Pass 1 VS: Pre-flips Y once per vertex
@@ -150,12 +165,11 @@ precision highp float;
 precision highp int;
 
 uniform mediump sampler2D uCurrDown;
+uniform float uWhitePixThresh;
 
 layout(location = 0) out uvec4 outH0;
 layout(location = 1) out uvec4 outH1;
 layout(location = 2) out uvec4 outStats;
-
-const float WHITE_PIXEL_THRESHOLD = 180.0 / 255.0;
 
 void main() {
     ivec2 tile = ivec2(gl_FragCoord.xy);
@@ -181,7 +195,7 @@ void main() {
 
             actCnt += ca;
             sumW255 += uint(s.r * 255.0 + 0.5) * ca;
-            whiteCnt += uint(s.r >= WHITE_PIXEL_THRESHOLD) * ca;
+            whiteCnt += uint(s.r >= uWhitePixThresh) * ca;
 
             uint bin = min(uint(s.r * 31.0 + 0.5), 31u);
             uint addVal = ca << ((bin & 3u) << 3u);
@@ -214,17 +228,12 @@ uniform highp usampler2D uTileStats;
 uniform highp usampler2D uPrevState;
 uniform float uDtMs;
 uniform int uResetState;
+uniform float uSensitivity;
 
 out uvec4 outState;
 
 const float MIN_ACTIVE_PIXELS     = 144.0;
-const float SUSTAINED_WHITE_PEAK  = 220.0 / 255.0;
-const float SUSTAINED_WHITE_MEAN  = 120.0 / 255.0;
-const float SUSTAINED_WHITE_RATIO = 0.30;
 const float MAX_WHITE_LUMA        = 140.0 / 255.0;
-const float FLASH_WHITE_PEAK      = 200.0 / 255.0;
-const float FLASH_WHITE_DELTA     = 35.0 / 255.0;
-const float FLASH_WHITE_RATIO     = 0.20;
 const float AUTO_AIM              = 0.55;
 const float BASELINE_TAU_MS       = 1000.0;
 const float MIN_GAIN              = 0.05;
@@ -329,16 +338,25 @@ void main() {
     float meanFrameDiff = hasPrevDown ? (frameDiff / diffDenom) : 0.0;
     bool isSceneCut = hasPrevDown && (meanFrameDiff >= SCENE_CUT_DIFF);
 
+    // Sensitivity-scaled thresholds (0.0 = strictest, 0.5 = balanced default, 1.0 = most sensitive)
+    float sens = clamp(uSensitivity, 0.0, 1.0);
+    float sustainedPeak  = mix(238.0 / 255.0, 214.0 / 255.0, sens);
+    float sustainedMean  = mix(165.0 / 255.0, 115.0 / 255.0, sens);
+    float sustainedRatio = mix(0.52, 0.24, sens);
+    float flashPeak      = mix(225.0 / 255.0, 195.0 / 255.0, sens);
+    float flashDelta     = mix(65.0 / 255.0, 25.0 / 255.0, sens);
+    float flashRatio     = mix(0.38, 0.16, sens);
+
     bool isSustainedWhite =
-        (whitePeak >= SUSTAINED_WHITE_PEAK) &&
-        (whiteMean >= SUSTAINED_WHITE_MEAN) &&
-        (whiteRatio >= SUSTAINED_WHITE_RATIO);
+        (whitePeak >= sustainedPeak) &&
+        (whiteMean >= sustainedMean) &&
+        (whiteRatio >= sustainedRatio);
 
     bool isSuddenFlash =
         hasBaseline &&
-        (whitePeak >= FLASH_WHITE_PEAK) &&
-        ((whitePeak - baseline) >= FLASH_WHITE_DELTA) &&
-        (whiteRatio >= FLASH_WHITE_RATIO);
+        (whitePeak >= flashPeak) &&
+        ((whitePeak - baseline) >= flashDelta) &&
+        (whiteRatio >= flashRatio);
 
     bool isFlashing = isSustainedWhite || isSuddenFlash;
 
@@ -385,8 +403,8 @@ void main() {
         nextGain = targetGain;
     } else if (!isFlashing && nextHold <= 0.0) {
         float washFactor = max(
-            smoothstep(0.08, 0.22, whiteRatio),
-            smoothstep(0.32, 0.48, whiteMean)
+            smoothstep(sustainedRatio * 0.55, sustainedRatio * 0.95, whiteRatio),
+            smoothstep(sustainedMean * 1.05, sustainedMean * 1.35, whiteMean)
         );
         float ceilingGain = clamp(MAX_WHITE_LUMA / max(0.004, whitePeak), MIN_GAIN, 1.0);
         float recoveryTarget = mix(1.0, ceilingGain, washFactor);
@@ -453,8 +471,10 @@ void main() {
     let programsReady = false;
     let pendingShaders = [];
     let compilePollRafId = null;
+    let locWhitePixThresh = null;
     let locDtMs = null;
     let locResetState = null;
+    let locSensitivity = null;
     let locUvScale = null;
 
     let videoTex = null;
@@ -473,6 +493,7 @@ void main() {
 
     // Cached GL uniform / viewport state
     let lastSentReset = -1;
+    let lastUploadedSensitivity = NaN;
     let uvScaleX = 1.0;
     let uvScaleY = 1.0;
     let lastUploadedUvScaleX = NaN;
@@ -540,6 +561,7 @@ void main() {
     let optAutoEl = null;
     let optManualEl = null;
     let sliderContEl = null;
+    let sliderLabelEl = null;
     let sliderInputEl = null;
     let sliderValEl = null;
     let isPopupOpen = false;
@@ -582,6 +604,26 @@ void main() {
         return prog;
     }
 
+    function getWhitePixThreshold(sens) {
+        // 0.0 (strict) -> 230/255, 0.5 (balanced default) -> 205/255, 1.0 (sensitive) -> 180/255
+        return (230.0 - 50.0 * sens) / 255.0;
+    }
+
+    function uploadSensitivityUniforms() {
+        if (!gl || !programsReady || isContextLost || webglFailed) return;
+        if (autoSensitivity === lastUploadedSensitivity) return;
+        if (progPass2a && locWhitePixThresh) {
+            gl.useProgram(progPass2a);
+            gl.uniform1f(locWhitePixThresh, getWhitePixThreshold(autoSensitivity));
+        }
+        if (progPass2b && locSensitivity) {
+            gl.useProgram(progPass2b);
+            gl.uniform1f(locSensitivity, autoSensitivity);
+        }
+        gl.useProgram(null);
+        lastUploadedSensitivity = autoSensitivity;
+    }
+
     function finalizePrograms() {
         if (!gl || !progPass1 || !progPass2a || !progPass2b || !progPass3) return false;
         try {
@@ -604,6 +646,8 @@ void main() {
 
             gl.useProgram(progPass2a);
             gl.uniform1i(gl.getUniformLocation(progPass2a, "uCurrDown"), 1);
+            locWhitePixThresh = gl.getUniformLocation(progPass2a, "uWhitePixThresh");
+            gl.uniform1f(locWhitePixThresh, getWhitePixThreshold(autoSensitivity));
 
             gl.useProgram(progPass2b);
             gl.uniform1i(gl.getUniformLocation(progPass2b, "uPrevState"), 2);
@@ -612,6 +656,9 @@ void main() {
             gl.uniform1i(gl.getUniformLocation(progPass2b, "uTileStats"), 5);
             locDtMs = gl.getUniformLocation(progPass2b, "uDtMs");
             locResetState = gl.getUniformLocation(progPass2b, "uResetState");
+            locSensitivity = gl.getUniformLocation(progPass2b, "uSensitivity");
+            gl.uniform1f(locSensitivity, autoSensitivity);
+            lastUploadedSensitivity = autoSensitivity;
 
             gl.useProgram(progPass3);
             gl.uniform1i(gl.getUniformLocation(progPass3, "uVideo"), 0);
@@ -829,8 +876,9 @@ void main() {
         tileFbo = null;
         stateTex = [null, null];
         stateFbo = [null, null];
-        locDtMs = locResetState = locUvScale = null;
+        locWhitePixThresh = locDtMs = locResetState = locSensitivity = locUvScale = null;
         lastSentReset = -1;
+        lastUploadedSensitivity = NaN;
         lastUploadedUvScaleX = NaN;
         lastUploadedUvScaleY = NaN;
     }
@@ -1837,17 +1885,24 @@ void main() {
             opt.setAttribute("aria-checked", isActive ? "true" : "false");
         }
 
-        const pct = Math.round(manualGain * 100);
+        const isAuto = currentMode === "auto";
+        const pct = Math.round((isAuto ? autoSensitivity : manualGain) * 100);
+        if (sliderLabelEl) {
+            sliderLabelEl.textContent = isAuto ? "Auto Sensitivity" : "Manual Brightness";
+        }
         if (sliderInputEl) {
+            sliderInputEl.min = isAuto ? String(Math.round(MIN_AUTO_SENSITIVITY * 100)) : String(Math.round(MIN_MANUAL_GAIN * 100));
+            sliderInputEl.max = isAuto ? String(Math.round(MAX_AUTO_SENSITIVITY * 100)) : String(Math.round(MAX_MANUAL_GAIN * 100));
             sliderInputEl.value = String(pct);
+            sliderInputEl.setAttribute("aria-label", isAuto ? "Auto sensitivity percentage" : "Manual brightness percentage");
             sliderInputEl.setAttribute("aria-valuetext", pct + "%");
-            sliderInputEl.disabled = currentMode !== "manual";
+            sliderInputEl.disabled = false;
         }
         if (sliderValEl) {
             sliderValEl.textContent = pct + "%";
         }
         if (sliderContEl) {
-            sliderContEl.dataset.disabled = currentMode === "manual" ? "false" : "true";
+            sliderContEl.dataset.disabled = "false";
         }
     }
 
@@ -1938,9 +1993,6 @@ void main() {
                 webglFailed = false;
                 applyFilterState();
                 syncAllUI();
-                if (modeKey === "auto") {
-                    closePopup(false);
-                }
             });
 
             return item;
@@ -1957,45 +2009,61 @@ void main() {
         const sliderHeader = document.createElement("div");
         sliderHeader.className = "yt-fbd-slider-header";
 
-        const sliderLabel = document.createElement("label");
-        sliderLabel.htmlFor = "yt-fbd-slider-input";
-        sliderLabel.textContent = "Manual Brightness";
+        sliderLabelEl = document.createElement("label");
+        sliderLabelEl.htmlFor = "yt-fbd-slider-input";
+        sliderLabelEl.textContent = "Auto Sensitivity";
 
         sliderValEl = document.createElement("span");
         sliderValEl.id = "yt-fbd-slider-val";
 
-        sliderHeader.append(sliderLabel, sliderValEl);
+        sliderHeader.append(sliderLabelEl, sliderValEl);
         sliderContEl.appendChild(sliderHeader);
 
         sliderInputEl = document.createElement("input");
         sliderInputEl.id = "yt-fbd-slider-input";
         sliderInputEl.type = "range";
-        sliderInputEl.min = String(Math.round(MIN_MANUAL_GAIN * 100));
-        sliderInputEl.max = String(Math.round(MAX_MANUAL_GAIN * 100));
+        sliderInputEl.min = "0";
+        sliderInputEl.max = "100";
         sliderInputEl.step = "5";
-        sliderInputEl.setAttribute("aria-label", "Manual brightness percentage");
+        sliderInputEl.setAttribute("aria-label", "Auto sensitivity percentage");
 
         sliderInputEl.addEventListener("input", (e) => {
             const pct = parseInt(e.target.value, 10);
-            manualGain = clampManualGain(pct / 100);
-            const rounded = Math.round(manualGain * 100);
-            sliderValEl.textContent = rounded + "%";
-            sliderInputEl.setAttribute("aria-valuetext", rounded + "%");
-
             if (!isEnabled) {
                 isEnabled = true;
                 saveEnabled(true);
                 syncAllUI();
             }
-            if (currentMode === "manual" && activeVideo) {
-                activeVideo.style.transitionProperty = "filter";
-                activeVideo.style.transitionDuration = "0ms";
-                activeVideo.style.filter = "brightness(" + manualGain.toFixed(3) + ")";
+
+            if (currentMode === "manual") {
+                manualGain = clampManualGain(pct / 100);
+                const rounded = Math.round(manualGain * 100);
+                sliderValEl.textContent = rounded + "%";
+                sliderInputEl.setAttribute("aria-valuetext", rounded + "%");
+                if (activeVideo) {
+                    activeVideo.style.transitionProperty = "filter";
+                    activeVideo.style.transitionDuration = "0ms";
+                    activeVideo.style.filter = "brightness(" + manualGain.toFixed(3) + ")";
+                }
+            } else {
+                autoSensitivity = clampAutoSensitivity(pct / 100);
+                const rounded = Math.round(autoSensitivity * 100);
+                sliderValEl.textContent = rounded + "%";
+                sliderInputEl.setAttribute("aria-valuetext", rounded + "%");
+                uploadSensitivityUniforms();
+                needsStateReset = true;
+                if (activeVideo && activeVideo.paused && activeVideo.readyState >= 2) {
+                    renderFrame(activeVideo, true, performance.now());
+                }
             }
         });
 
         sliderInputEl.addEventListener("change", () => {
-            saveManualGain(manualGain);
+            if (currentMode === "manual") {
+                saveManualGain(manualGain);
+            } else {
+                saveAutoSensitivity(autoSensitivity);
+            }
         });
 
         sliderContEl.appendChild(sliderInputEl);
@@ -2317,7 +2385,7 @@ void main() {
             try { popupEl.remove(); } catch { }
             popupEl = null;
         }
-        powerPillEl = optAutoEl = optManualEl = sliderContEl = sliderInputEl = sliderValEl = null;
+        powerPillEl = optAutoEl = optManualEl = sliderContEl = sliderLabelEl = sliderInputEl = sliderValEl = null;
 
         if (wrapperEl) {
             try { wrapperEl.remove(); } catch { }
