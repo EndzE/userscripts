@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Flashbang Defender
 // @namespace    https://github.com/EndzE
-// @version      1.2.0
+// @version      1.3.0
 // @description  Your favourite creators don't care about your eyes opening fully white pages in their videos? Care about your eyes yourself with Flashbang Defender.
 // @author       EndzE
 // @license      MIT
@@ -17,12 +17,12 @@
 // @updateURL    https://raw.githubusercontent.com/EndzE/userscripts/main/youtube-flashbang-defender.user.js
 // ==/UserScript==
 
-(function() {
+(function () {
     "use strict";
 
     // Teardown any previous instance in the same execution context
     if (typeof window.__YT_FBD_STOP__ === "function") {
-        try { window.__YT_FBD_STOP__(); } catch {}
+        try { window.__YT_FBD_STOP__(); } catch { }
     }
 
     // --- Persistence (single backend, always validated) ---
@@ -59,7 +59,7 @@
             } else {
                 localStorage.setItem(key, String(value));
             }
-        } catch {}
+        } catch { }
     }
 
     const getSavedEnabled = () => {
@@ -141,17 +141,76 @@ void main() {
     gl_Position = vec4(pos, 0.0, 1.0);
 }`;
 
-    // Pass 2 FS: 1x1 RGBA32UI detector + register-packed 32-bin histogram + scene-cut + strobe guard
+    // Pass 2a FS: 8x3 parallel tile reduction (24 threads x 4x6=24 texels/tile, 3x core RGBA32UI MRT)
+    //   outH0: bins 0..15 packed as 4x8-bit counters per uint (max 24 <= 255)
+    //   outH1: bins 16..31 packed as 4x8-bit counters per uint
+    //   outStats: (sumW255, sumDiff255, activeCount | (diffActiveCount << 16), whitePixelCount)
+    const PASS2A_FRAG_SRC = `#version 300 es
+precision highp float;
+precision highp int;
+
+uniform mediump sampler2D uCurrDown;
+
+layout(location = 0) out uvec4 outH0;
+layout(location = 1) out uvec4 outH1;
+layout(location = 2) out uvec4 outStats;
+
+const float WHITE_PIXEL_THRESHOLD = 180.0 / 255.0;
+
+void main() {
+    ivec2 tile = ivec2(gl_FragCoord.xy);
+    int x0 = tile.x * 4;
+    int y0 = tile.y * 6;
+
+    uvec4 h0 = uvec4(0u);
+    uvec4 h1 = uvec4(0u);
+    uint sumW255 = 0u;
+    uint sumDiff255 = 0u;
+    uint actCnt = 0u;
+    uint diffCnt = 0u;
+    uint whiteCnt = 0u;
+
+    for (int dy = 0; dy < 6; dy++) {
+        for (int dx = 0; dx < 4; dx++) {
+            vec4 s = texelFetch(uCurrDown, ivec2(x0 + dx, y0 + dy), 0);
+            uint da = uint(s.g >= 0.2);
+            uint ca = uint(s.g >= 0.5);
+
+            diffCnt += da;
+            sumDiff255 += uint(s.a * 255.0 + 0.5) * da;
+
+            actCnt += ca;
+            sumW255 += uint(s.r * 255.0 + 0.5) * ca;
+            whiteCnt += uint(s.r >= WHITE_PIXEL_THRESHOLD) * ca;
+
+            uint bin = min(uint(s.r * 31.0 + 0.5), 31u);
+            uint addVal = ca << ((bin & 3u) << 3u);
+            uint slot = bin >> 2u;
+            uvec4 m = uvec4(equal(uvec4(slot & 3u), uvec4(0u, 1u, 2u, 3u))) * addVal;
+            uint isHi = slot >> 2u;
+            h0 += m * (1u - isHi);
+            h1 += m * isHi;
+        }
+    }
+
+    outH0 = h0;
+    outH1 = h1;
+    outStats = uvec4(sumW255, sumDiff255, actCnt | (diffCnt << 16u), whiteCnt);
+}`;
+
+    // Pass 2b FS: 1x1 RGBA32UI detector + SIMD 24-tile histogram merge + scene-cut + strobe guard
     // State uvec4:
     //   r: floatBitsToUint(gain)
     //   g: floatBitsToUint(baseline)
     //   b: packUnorm2x16(vec2(holdRemaining, strobeHeat))
     //   a: flags bitmask (bit0=hasBaseline, bit1=wasFlashing, bit2=hasPrevDown)
-    const PASS2_FRAG_SRC = `#version 300 es
+    const PASS2B_FRAG_SRC = `#version 300 es
 precision highp float;
 precision highp int;
 
-uniform mediump sampler2D uCurrDown;
+uniform highp usampler2D uTileH0;
+uniform highp usampler2D uTileH1;
+uniform highp usampler2D uTileStats;
 uniform highp usampler2D uPrevState;
 uniform float uDtMs;
 uniform int uResetState;
@@ -159,7 +218,6 @@ uniform int uResetState;
 out uvec4 outState;
 
 const float MIN_ACTIVE_PIXELS     = 144.0;
-const float WHITE_PIXEL_THRESHOLD = 180.0 / 255.0;
 const float SUSTAINED_WHITE_PEAK  = 220.0 / 255.0;
 const float SUSTAINED_WHITE_MEAN  = 120.0 / 255.0;
 const float SUSTAINED_WHITE_RATIO = 0.30;
@@ -180,17 +238,13 @@ const float STROBE_HOLD_MS        = 750.0;
 
 void consumePair(uint packed, int baseBin, int topCount, inout int taken, inout int peakSum) {
     int hi = int(packed >> 16u);
-    if (hi > 0 && taken < topCount) {
-        int take = min(hi, topCount - taken);
-        peakSum += take * (baseBin + 1);
-        taken += take;
-    }
+    int takeHi = min(hi, topCount - taken);
+    peakSum += takeHi * (baseBin + 1);
+    taken += takeHi;
     int lo = int(packed & 0xFFFFu);
-    if (lo > 0 && taken < topCount) {
-        int take = min(lo, topCount - taken);
-        peakSum += take * baseBin;
-        taken += take;
-    }
+    int takeLo = min(lo, topCount - taken);
+    peakSum += takeLo * baseBin;
+    taken += takeLo;
 }
 
 void main() {
@@ -214,74 +268,57 @@ void main() {
         hasPrevDown = (prev.a & 4u) != 0u;
     }
 
-    // 32 histogram bins packed as 2x16-bit counters per uint across 4 uvec4 registers (zero local-memory spill)
-    uvec4 h0 = uvec4(0u);
-    uvec4 h1 = uvec4(0u);
-    uvec4 h2 = uvec4(0u);
-    uvec4 h3 = uvec4(0u);
+    // Merge 24 tiles (8x3), widening 8-bit bins to 16-bit SIMD lanes (max 576 << 65535)
+    uvec4 a0 = uvec4(0u);
+    uvec4 a1 = uvec4(0u);
+    uvec4 b0 = uvec4(0u);
+    uvec4 b1 = uvec4(0u);
+    uvec4 st = uvec4(0u);
 
-    float totalWhite = 0.0;
-    float whitePixelCount = 0.0;
-    float activePixels = 0.0;
-    float frameDiff = 0.0;
-    float diffActivePixels = 0.0;
-
-    for (int y = 0; y < 18; y++) {
-        for (int x = 0; x < 32; x++) {
-            vec4 currS = texelFetch(uCurrDown, ivec2(x, y), 0);
-            if (currS.g < 0.2) continue;
-
-            diffActivePixels += 1.0;
-            frameDiff += currS.a;
-
-            if (currS.g < 0.5) continue;
-
-            float w = currS.r;
-            activePixels += 1.0;
-            totalWhite += w;
-            whitePixelCount += step(WHITE_PIXEL_THRESHOLD, w);
-
-            uint bin = min(uint(w * 31.0 + 0.5), 31u);
-            uint addVal = ((bin & 1u) == 0u) ? 1u : 65536u;
-            uint slot = bin >> 1u;
-            uvec4 mask = uvec4(equal(uvec4(slot & 3u), uvec4(0u, 1u, 2u, 3u))) * addVal;
-            uint grp = slot >> 2u;
-            if (grp < 2u) {
-                if (grp == 0u) h0 += mask;
-                else h1 += mask;
-            } else {
-                if (grp == 2u) h2 += mask;
-                else h3 += mask;
-            }
+    for (int ty = 0; ty < 3; ty++) {
+        for (int tx = 0; tx < 8; tx++) {
+            uvec4 r0 = texelFetch(uTileH0, ivec2(tx, ty), 0);
+            uvec4 r1 = texelFetch(uTileH1, ivec2(tx, ty), 0);
+            a0 += r0 & 0x00FF00FFu;
+            a1 += (r0 >> 8u) & 0x00FF00FFu;
+            b0 += r1 & 0x00FF00FFu;
+            b1 += (r1 >> 8u) & 0x00FF00FFu;
+            st += texelFetch(uTileStats, ivec2(tx, ty), 0);
         }
     }
+
+    float totalWhite = float(st.x) / 255.0;
+    float frameDiff = float(st.y) / 255.0;
+    float activePixels = float(st.z & 0xFFFFu);
+    float diffActivePixels = float(st.z >> 16u);
+    float whitePixelCount = float(st.w);
 
     float denom = max(activePixels, MIN_ACTIVE_PIXELS);
     int topCount = max(1, int(floor(denom * 0.10 + 0.5)));
 
     int taken = 0;
     int peakSum = 0;
-    consumePair(h3.w, 30, topCount, taken, peakSum);
-    consumePair(h3.z, 28, topCount, taken, peakSum);
-    consumePair(h3.y, 26, topCount, taken, peakSum);
-    consumePair(h3.x, 24, topCount, taken, peakSum);
+    consumePair((b1.w & 0xFFFF0000u) | (b0.w >> 16u), 30, topCount, taken, peakSum);
+    consumePair(((b1.w & 0xFFFFu) << 16u) | (b0.w & 0xFFFFu), 28, topCount, taken, peakSum);
+    consumePair((b1.z & 0xFFFF0000u) | (b0.z >> 16u), 26, topCount, taken, peakSum);
+    consumePair(((b1.z & 0xFFFFu) << 16u) | (b0.z & 0xFFFFu), 24, topCount, taken, peakSum);
     if (taken < topCount) {
-        consumePair(h2.w, 22, topCount, taken, peakSum);
-        consumePair(h2.z, 20, topCount, taken, peakSum);
-        consumePair(h2.y, 18, topCount, taken, peakSum);
-        consumePair(h2.x, 16, topCount, taken, peakSum);
+        consumePair((b1.y & 0xFFFF0000u) | (b0.y >> 16u), 22, topCount, taken, peakSum);
+        consumePair(((b1.y & 0xFFFFu) << 16u) | (b0.y & 0xFFFFu), 20, topCount, taken, peakSum);
+        consumePair((b1.x & 0xFFFF0000u) | (b0.x >> 16u), 18, topCount, taken, peakSum);
+        consumePair(((b1.x & 0xFFFFu) << 16u) | (b0.x & 0xFFFFu), 16, topCount, taken, peakSum);
     }
     if (taken < topCount) {
-        consumePair(h1.w, 14, topCount, taken, peakSum);
-        consumePair(h1.z, 12, topCount, taken, peakSum);
-        consumePair(h1.y, 10, topCount, taken, peakSum);
-        consumePair(h1.x,  8, topCount, taken, peakSum);
+        consumePair((a1.w & 0xFFFF0000u) | (a0.w >> 16u), 14, topCount, taken, peakSum);
+        consumePair(((a1.w & 0xFFFFu) << 16u) | (a0.w & 0xFFFFu), 12, topCount, taken, peakSum);
+        consumePair((a1.z & 0xFFFF0000u) | (a0.z >> 16u), 10, topCount, taken, peakSum);
+        consumePair(((a1.z & 0xFFFFu) << 16u) | (a0.z & 0xFFFFu), 8, topCount, taken, peakSum);
     }
     if (taken < topCount) {
-        consumePair(h0.w,  6, topCount, taken, peakSum);
-        consumePair(h0.z,  4, topCount, taken, peakSum);
-        consumePair(h0.y,  2, topCount, taken, peakSum);
-        consumePair(h0.x,  0, topCount, taken, peakSum);
+        consumePair((a1.y & 0xFFFF0000u) | (a0.y >> 16u), 6, topCount, taken, peakSum);
+        consumePair(((a1.y & 0xFFFFu) << 16u) | (a0.y & 0xFFFFu), 4, topCount, taken, peakSum);
+        consumePair((a1.x & 0xFFFF0000u) | (a0.x >> 16u), 2, topCount, taken, peakSum);
+        consumePair(((a1.x & 0xFFFFu) << 16u) | (a0.x & 0xFFFFu), 0, topCount, taken, peakSum);
     }
 
     float whiteMean = totalWhite / denom;
@@ -409,8 +446,13 @@ void main() {
     let gl = null;
     let glVao = null;
     let progPass1 = null;
-    let progPass2 = null;
+    let progPass2a = null;
+    let progPass2b = null;
     let progPass3 = null;
+    let extParallelCompile = null;
+    let programsReady = false;
+    let pendingShaders = [];
+    let compilePollRafId = null;
     let locDtMs = null;
     let locResetState = null;
     let locUvScale = null;
@@ -420,6 +462,9 @@ void main() {
     let downFbo = [null, null];
     let downReadIdx = 0;
     let downWriteIdx = 1;
+
+    let tileTex = [null, null, null];
+    let tileFbo = null;
 
     let stateTex = [null, null];
     let stateFbo = [null, null];
@@ -446,6 +491,7 @@ void main() {
     let cachedLeft = NaN;
     let cachedTop = NaN;
     let cachedTransform = "";
+    let cachedObjectFit = "";
     let cachedVideoW = 0;
     let cachedVideoH = 0;
     let cachedTargetW = 0;
@@ -467,22 +513,24 @@ void main() {
 
     // --- Runtime / Lifecycle State ---
     let activeVideo = null;
+    let videoSupportsVfc = false;
     let frameHandle = null;
     let isUsingVfc = false;
     let isIntersecting = true;
+    let lastNavUrl = location.href;
 
     let navTimer = null;
     let mountRetryTimer = null;
-    let fsTimer1 = null;
-    let fsTimer2 = null;
 
     let videoIntersectionObserver = null;
     let videoResizeObserver = null;
     let videoStyleObserver = null;
     let actionBarObserver = null;
     let observedActionBar = null;
+    let actionBarSyncQueued = false;
 
     // Cached UI element references
+    let styleEl = null;
     let wrapperEl = null;
     let btnEl = null;
     let dotEl = null;
@@ -495,37 +543,128 @@ void main() {
     let sliderInputEl = null;
     let sliderValEl = null;
     let isPopupOpen = false;
+    let lastBtnStateKey = "";
 
-    const USE_DESYNCHRONIZED = !/Android|CrOS/i.test(navigator.userAgent);
+    // Disabled: desynchronized causes D3D11/DWM swapchain stall spikes on desktop displays
+    const USE_DESYNCHRONIZED = false;
 
     // --- WebGL2 Setup & Teardown ---
-    function compileShader(context, type, src) {
-        const shader = context.createShader(type);
-        context.shaderSource(shader, src);
-        context.compileShader(shader);
-        if (!context.getShaderParameter(shader, context.COMPILE_STATUS)) {
-            const log = context.getShaderInfoLog(shader);
-            context.deleteShader(shader);
-            throw new Error("Shader compile error: " + log);
+    function cancelCompilePoll() {
+        if (compilePollRafId !== null) {
+            cancelAnimationFrame(compilePollRafId);
+            compilePollRafId = null;
         }
-        return shader;
     }
 
-    function createProgram(context, vertSrc, fragSrc) {
-        const vs = compileShader(context, context.VERTEX_SHADER, vertSrc);
-        const fs = compileShader(context, context.FRAGMENT_SHADER, fragSrc);
+    function deletePendingShaders() {
+        if (gl && !gl.isContextLost()) {
+            for (let i = 0; i < pendingShaders.length; i++) {
+                try { gl.deleteShader(pendingShaders[i]); } catch { }
+            }
+        }
+        pendingShaders = [];
+    }
+
+    function startProgramLink(context, vertSrc, fragSrc) {
+        const vs = context.createShader(context.VERTEX_SHADER);
+        context.shaderSource(vs, vertSrc);
+        context.compileShader(vs);
+
+        const fs = context.createShader(context.FRAGMENT_SHADER);
+        context.shaderSource(fs, fragSrc);
+        context.compileShader(fs);
+
         const prog = context.createProgram();
         context.attachShader(prog, vs);
         context.attachShader(prog, fs);
         context.linkProgram(prog);
-        context.deleteShader(vs);
-        context.deleteShader(fs);
-        if (!context.getProgramParameter(prog, context.LINK_STATUS)) {
-            const log = context.getProgramInfoLog(prog);
-            context.deleteProgram(prog);
-            throw new Error("Program link error: " + log);
-        }
+        pendingShaders.push(vs, fs);
         return prog;
+    }
+
+    function finalizePrograms() {
+        if (!gl || !progPass1 || !progPass2a || !progPass2b || !progPass3) return false;
+        try {
+            const progs = [progPass1, progPass2a, progPass2b, progPass3];
+            for (let i = 0; i < progs.length; i++) {
+                if (!gl.getProgramParameter(progs[i], gl.LINK_STATUS)) {
+                    throw new Error("Program link error: " + gl.getProgramInfoLog(progs[i]));
+                }
+            }
+            deletePendingShaders();
+
+            // Dedicated persistent texture units:
+            //   Unit 0: videoTex (never rebound)
+            //   Unit 1: downTex ping-pong
+            //   Unit 2: stateTex ping-pong
+            //   Units 3..5: tileTex[0..2] (8x3 MRT, never rebound)
+            gl.useProgram(progPass1);
+            gl.uniform1i(gl.getUniformLocation(progPass1, "uVideo"), 0);
+            gl.uniform1i(gl.getUniformLocation(progPass1, "uPrevDown"), 1);
+
+            gl.useProgram(progPass2a);
+            gl.uniform1i(gl.getUniformLocation(progPass2a, "uCurrDown"), 1);
+
+            gl.useProgram(progPass2b);
+            gl.uniform1i(gl.getUniformLocation(progPass2b, "uPrevState"), 2);
+            gl.uniform1i(gl.getUniformLocation(progPass2b, "uTileH0"), 3);
+            gl.uniform1i(gl.getUniformLocation(progPass2b, "uTileH1"), 4);
+            gl.uniform1i(gl.getUniformLocation(progPass2b, "uTileStats"), 5);
+            locDtMs = gl.getUniformLocation(progPass2b, "uDtMs");
+            locResetState = gl.getUniformLocation(progPass2b, "uResetState");
+
+            gl.useProgram(progPass3);
+            gl.uniform1i(gl.getUniformLocation(progPass3, "uVideo"), 0);
+            gl.uniform1i(gl.getUniformLocation(progPass3, "uState"), 2);
+            locUvScale = gl.getUniformLocation(progPass3, "uUvScale");
+            gl.uniform2f(locUvScale, uvScaleX, uvScaleY);
+            lastUploadedUvScaleX = uvScaleX;
+            lastUploadedUvScaleY = uvScaleY;
+            gl.useProgram(null);
+
+            programsReady = true;
+            return true;
+        } catch {
+            deletePendingShaders();
+            handleFatalWebGLError();
+            return false;
+        }
+    }
+
+    function checkProgramsReady() {
+        if (programsReady) return true;
+        if (!gl || isContextLost || webglFailed || !progPass1 || !progPass2a || !progPass2b || !progPass3) {
+            return false;
+        }
+        if (extParallelCompile) {
+            const flag = extParallelCompile.COMPLETION_STATUS_KHR;
+            if (
+                !gl.getProgramParameter(progPass1, flag) ||
+                !gl.getProgramParameter(progPass2a, flag) ||
+                !gl.getProgramParameter(progPass2b, flag) ||
+                !gl.getProgramParameter(progPass3, flag)
+            ) {
+                return false;
+            }
+        }
+        return finalizePrograms();
+    }
+
+    function scheduleCompilePoll() {
+        if (compilePollRafId !== null || programsReady || webglFailed || isContextLost) return;
+        compilePollRafId = requestAnimationFrame(() => {
+            compilePollRafId = null;
+            if (!isEnabled || currentMode !== "auto" || !activeVideo || webglFailed || isContextLost) return;
+            if (checkProgramsReady()) {
+                if (activeVideo.paused && activeVideo.readyState >= 2) {
+                    renderFrame(activeVideo, true, performance.now());
+                } else {
+                    scheduleNextFrame(activeVideo);
+                }
+            } else {
+                scheduleCompilePoll();
+            }
+        });
     }
 
     function createVideoTexture(context) {
@@ -564,38 +703,37 @@ void main() {
         return fbo;
     }
 
+    function createTileMrtFbo(context, textures) {
+        const fbo = context.createFramebuffer();
+        context.bindFramebuffer(context.FRAMEBUFFER, fbo);
+        context.framebufferTexture2D(context.FRAMEBUFFER, context.COLOR_ATTACHMENT0, context.TEXTURE_2D, textures[0], 0);
+        context.framebufferTexture2D(context.FRAMEBUFFER, context.COLOR_ATTACHMENT1, context.TEXTURE_2D, textures[1], 0);
+        context.framebufferTexture2D(context.FRAMEBUFFER, context.COLOR_ATTACHMENT2, context.TEXTURE_2D, textures[2], 0);
+        context.drawBuffers([context.COLOR_ATTACHMENT0, context.COLOR_ATTACHMENT1, context.COLOR_ATTACHMENT2]);
+        const status = context.checkFramebufferStatus(context.FRAMEBUFFER);
+        context.bindFramebuffer(context.FRAMEBUFFER, null);
+        if (status !== context.FRAMEBUFFER_COMPLETE) {
+            context.deleteFramebuffer(fbo);
+            throw new Error("Incomplete MRT FBO: " + status);
+        }
+        return fbo;
+    }
+
     function initWebGLResources() {
         if (!gl) return false;
         try {
+            cancelCompilePoll();
+            programsReady = false;
+            extParallelCompile = gl.getExtension("KHR_parallel_shader_compile");
+
             glVao = gl.createVertexArray();
             gl.bindVertexArray(glVao); // Permanently bound for this private context
 
-            progPass1 = createProgram(gl, VERT_PASS1_SRC, PASS1_FRAG_SRC);
-            progPass2 = createProgram(gl, VERT_PASS2_SRC, PASS2_FRAG_SRC);
-            progPass3 = createProgram(gl, VERT_PASS3_SRC, PASS3_FRAG_SRC);
-
-            // Dedicated persistent texture units:
-            //   Unit 0: videoTex (never rebound)
-            //   Unit 1: downTex ping-pong
-            //   Unit 2: stateTex ping-pong
-            gl.useProgram(progPass1);
-            gl.uniform1i(gl.getUniformLocation(progPass1, "uVideo"), 0);
-            gl.uniform1i(gl.getUniformLocation(progPass1, "uPrevDown"), 1);
-
-            gl.useProgram(progPass2);
-            gl.uniform1i(gl.getUniformLocation(progPass2, "uCurrDown"), 1);
-            gl.uniform1i(gl.getUniformLocation(progPass2, "uPrevState"), 2);
-            locDtMs = gl.getUniformLocation(progPass2, "uDtMs");
-            locResetState = gl.getUniformLocation(progPass2, "uResetState");
-
-            gl.useProgram(progPass3);
-            gl.uniform1i(gl.getUniformLocation(progPass3, "uVideo"), 0);
-            gl.uniform1i(gl.getUniformLocation(progPass3, "uState"), 2);
-            locUvScale = gl.getUniformLocation(progPass3, "uUvScale");
-            gl.uniform2f(locUvScale, 1.0, 1.0);
-            lastUploadedUvScaleX = 1.0;
-            lastUploadedUvScaleY = 1.0;
-            gl.useProgram(null);
+            // Kick off all shader compiles & links upfront (non-blocking when KHR_parallel_shader_compile is present)
+            progPass1 = startProgramLink(gl, VERT_PASS1_SRC, PASS1_FRAG_SRC);
+            progPass2a = startProgramLink(gl, VERT_PASS2_SRC, PASS2A_FRAG_SRC);
+            progPass2b = startProgramLink(gl, VERT_PASS2_SRC, PASS2B_FRAG_SRC);
+            progPass3 = startProgramLink(gl, VERT_PASS3_SRC, PASS3_FRAG_SRC);
 
             videoTex = createVideoTexture(gl);
 
@@ -603,6 +741,11 @@ void main() {
             downTex[1] = createImmutableTexture(gl, gl.RGBA8, 32, 18, gl.NEAREST);
             downFbo[0] = createFbo(gl, downTex[0]);
             downFbo[1] = createFbo(gl, downTex[1]);
+
+            tileTex[0] = createImmutableTexture(gl, gl.RGBA32UI, 8, 3, gl.NEAREST);
+            tileTex[1] = createImmutableTexture(gl, gl.RGBA32UI, 8, 3, gl.NEAREST);
+            tileTex[2] = createImmutableTexture(gl, gl.RGBA32UI, 8, 3, gl.NEAREST);
+            tileFbo = createTileMrtFbo(gl, tileTex);
 
             // Initial 1x1 RGBA32UI state: gain=1.0f (0x3F800000), baseline=0, hold/heat=0, flags=0
             const initState = new Uint32Array([0x3F800000, 0, 0, 0]);
@@ -620,7 +763,13 @@ void main() {
             needsStateReset = true;
             lastSentReset = -1;
 
-            // Establish persistent unit bindings
+            // Establish all persistent unit bindings AFTER all textures are created
+            gl.activeTexture(gl.TEXTURE5);
+            gl.bindTexture(gl.TEXTURE_2D, tileTex[2]);
+            gl.activeTexture(gl.TEXTURE4);
+            gl.bindTexture(gl.TEXTURE_2D, tileTex[1]);
+            gl.activeTexture(gl.TEXTURE3);
+            gl.bindTexture(gl.TEXTURE_2D, tileTex[0]);
             gl.activeTexture(gl.TEXTURE2);
             gl.bindTexture(gl.TEXTURE_2D, stateTex[0]);
             gl.activeTexture(gl.TEXTURE1);
@@ -631,7 +780,12 @@ void main() {
             gl.clearColor(0.0, 0.0, 0.0, 1.0);
             gl.disable(gl.DEPTH_TEST);
             gl.disable(gl.BLEND);
-            return true;
+
+            if (!extParallelCompile) {
+                return finalizePrograms();
+            }
+            checkProgramsReady();
+            return !webglFailed;
         } catch {
             webglFailed = true;
             destroyWebGLResources();
@@ -640,6 +794,8 @@ void main() {
     }
 
     function destroyWebGLResources() {
+        cancelCompilePoll();
+        deletePendingShaders();
         if (gl && !gl.isContextLost()) {
             try {
                 if (videoTex) gl.deleteTexture(videoTex);
@@ -647,21 +803,30 @@ void main() {
                 if (downTex[1]) gl.deleteTexture(downTex[1]);
                 if (downFbo[0]) gl.deleteFramebuffer(downFbo[0]);
                 if (downFbo[1]) gl.deleteFramebuffer(downFbo[1]);
+                if (tileTex[0]) gl.deleteTexture(tileTex[0]);
+                if (tileTex[1]) gl.deleteTexture(tileTex[1]);
+                if (tileTex[2]) gl.deleteTexture(tileTex[2]);
+                if (tileFbo) gl.deleteFramebuffer(tileFbo);
                 if (stateTex[0]) gl.deleteTexture(stateTex[0]);
                 if (stateTex[1]) gl.deleteTexture(stateTex[1]);
                 if (stateFbo[0]) gl.deleteFramebuffer(stateFbo[0]);
                 if (stateFbo[1]) gl.deleteFramebuffer(stateFbo[1]);
                 if (progPass1) gl.deleteProgram(progPass1);
-                if (progPass2) gl.deleteProgram(progPass2);
+                if (progPass2a) gl.deleteProgram(progPass2a);
+                if (progPass2b) gl.deleteProgram(progPass2b);
                 if (progPass3) gl.deleteProgram(progPass3);
                 if (glVao) gl.deleteVertexArray(glVao);
-            } catch {}
+            } catch { }
         }
         glVao = null;
-        progPass1 = progPass2 = progPass3 = null;
+        progPass1 = progPass2a = progPass2b = progPass3 = null;
+        extParallelCompile = null;
+        programsReady = false;
         videoTex = null;
         downTex = [null, null];
         downFbo = [null, null];
+        tileTex = [null, null, null];
+        tileFbo = null;
         stateTex = [null, null];
         stateFbo = [null, null];
         locDtMs = locResetState = locUvScale = null;
@@ -675,7 +840,7 @@ void main() {
         try {
             gl.activeTexture(gl.TEXTURE0);
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-        } catch {}
+        } catch { }
         if (glCanvas.width !== 1 || glCanvas.height !== 1) {
             glCanvas.width = 1;
             glCanvas.height = 1;
@@ -688,6 +853,8 @@ void main() {
     function onContextLost(e) {
         e.preventDefault();
         isContextLost = true;
+        programsReady = false;
+        cancelCompilePoll();
         cancelFrameLoop();
         deactivateOverlayVisibility(false);
     }
@@ -708,25 +875,235 @@ void main() {
         }
     }
 
+    function ensureStyles() {
+        if (styleEl && styleEl.isConnected) return;
+        document.getElementById("yt-fbd-styles")?.remove();
+        styleEl = document.createElement("style");
+        styleEl.id = "yt-fbd-styles";
+        styleEl.textContent = `
+#yt-fbd-webgl-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 0;
+    height: 0;
+    pointer-events: none;
+    display: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    contain: strict;
+}
+#yt-flashbang-defender-wrapper {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    margin: 0 8px;
+    flex-shrink: 0;
+    vertical-align: middle;
+    height: 40px;
+}
+#yt-flashbang-defender-btn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 20px;
+    border: none;
+    background-color: var(--yt-spec-badge-chip-background, rgba(255, 255, 255, 0.1));
+    color: var(--yt-spec-text-primary, currentColor);
+    cursor: pointer;
+    padding: 0;
+    margin: 0;
+    box-sizing: border-box;
+    transition: background-color 0.2s;
+}
+#yt-flashbang-defender-wrapper:hover #yt-flashbang-defender-btn {
+    background-color: var(--yt-spec-button-chip-background-hover, rgba(255, 255, 255, 0.2));
+}
+#yt-fbd-green-dot {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background-color: #00e676;
+    box-shadow: 0 0 3px rgba(0, 230, 118, 0.7);
+    pointer-events: none;
+}
+#yt-flashbang-defender-btn[aria-pressed="false"] #yt-fbd-green-dot {
+    display: none;
+}
+#yt-flashbang-defender-tooltip {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: rgba(97, 97, 97, 0.95);
+    color: #ffffff;
+    font-family: "Roboto", "Arial", sans-serif;
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 400;
+    padding: 6px 10px;
+    border-radius: 4px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.15s ease-in-out, visibility 0.15s;
+    z-index: 99999;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+#yt-flashbang-defender-wrapper:hover:not([data-popup-open="true"]) #yt-flashbang-defender-tooltip {
+    opacity: 1;
+    visibility: visible;
+}
+#yt-flashbang-defender-popup {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 232px;
+    background-color: rgba(28, 28, 28, 0.98);
+    color: #ffffff;
+    font-family: "Roboto", "Arial", sans-serif;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 12px;
+    padding: 8px 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
+    z-index: 2147483647;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    user-select: none;
+    box-sizing: border-box;
+}
+.yt-fbd-popup-header {
+    padding: 4px 10px 6px 10px;
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: rgba(255, 255, 255, 0.55);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+#yt-fbd-power-pill {
+    border: none;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    cursor: pointer;
+    background-color: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.65);
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+#yt-fbd-power-pill[aria-pressed="true"] {
+    background-color: rgba(0, 230, 118, 0.18);
+    color: #00e676;
+}
+.yt-fbd-mode-group {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.yt-fbd-popup-opt {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: inherit;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+    box-sizing: border-box;
+}
+.yt-fbd-popup-opt[data-active="true"] {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+.yt-fbd-popup-opt:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+}
+.yt-fbd-opt-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.yt-fbd-opt-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: #ffffff;
+}
+.yt-fbd-opt-desc {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+}
+.yt-fbd-opt-check {
+    font-size: 14px;
+    font-weight: 700;
+    color: #00e676;
+    margin-left: 8px;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+.yt-fbd-popup-opt[data-active="true"] .yt-fbd-opt-check {
+    opacity: 1;
+}
+#yt-fbd-slider-container {
+    margin-top: 6px;
+    padding: 6px 10px 4px 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: opacity 0.2s ease;
+}
+#yt-fbd-slider-container[data-disabled="true"] {
+    opacity: 0.4;
+    pointer-events: none;
+}
+.yt-fbd-slider-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.7);
+}
+#yt-fbd-slider-val {
+    font-weight: 600;
+    color: #00e676;
+}
+#yt-fbd-slider-input {
+    width: 100%;
+    margin: 4px 0 2px 0;
+    accent-color: #00e676;
+    cursor: pointer;
+}`;
+        (document.head || document.documentElement).appendChild(styleEl);
+    }
+
     function ensureWebGLCanvas() {
         if (glCanvas && gl) return true;
         if (webglFailed) return false;
 
+        ensureStyles();
         glCanvas = document.createElement("canvas");
         glCanvas.id = "yt-fbd-webgl-canvas";
         glCanvas.setAttribute("aria-hidden", "true");
-        glCanvas.style.cssText = `
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 0;
-            height: 0;
-            pointer-events: none;
-            display: none;
-            margin: 0;
-            padding: 0;
-            border: 0;
-        `;
 
         glCanvas.addEventListener("webglcontextlost", onContextLost, false);
         glCanvas.addEventListener("webglcontextrestored", onContextRestored, false);
@@ -757,13 +1134,13 @@ void main() {
             try {
                 const ext = gl.getExtension("WEBGL_lose_context");
                 if (ext) ext.loseContext();
-            } catch {}
+            } catch { }
             gl = null;
         }
         if (glCanvas) {
             glCanvas.removeEventListener("webglcontextlost", onContextLost, false);
             glCanvas.removeEventListener("webglcontextrestored", onContextRestored, false);
-            try { glCanvas.remove(); } catch {}
+            try { glCanvas.remove(); } catch { }
             glCanvas = null;
         }
         isContextLost = false;
@@ -822,18 +1199,35 @@ void main() {
         }
     }
 
+    function parsePx(val) {
+        if (!val || !val.endsWith("px")) return NaN;
+        const n = parseFloat(val);
+        return Number.isFinite(n) ? n : NaN;
+    }
+
     function syncCanvasLayout() {
         if (!activeVideo || !activeVideo.isConnected) return false;
         if (!isEnabled || currentMode !== "auto" || webglFailed || isContextLost) return false;
         if (!attachCanvasToVideo(activeVideo)) return false;
 
-        const cssW = activeVideo.offsetWidth;
-        const cssH = activeVideo.offsetHeight;
-        if (cssW <= 0 || cssH <= 0) return false;
+        // Zero-reflow fast path: YouTube sets inline px geometry directly on video.style
+        const st = activeVideo.style;
+        let cssW = parsePx(st.width);
+        let cssH = parsePx(st.height);
+        let left = parsePx(st.left);
+        let top = parsePx(st.top);
 
-        const left = activeVideo.offsetLeft;
-        const top = activeVideo.offsetTop;
-        const vTransform = activeVideo.style.transform || "";
+        if (!(cssW > 0 && cssH > 0)) {
+            cssW = activeVideo.offsetWidth;
+            cssH = activeVideo.offsetHeight;
+            if (cssW <= 0 || cssH <= 0) return false;
+            left = activeVideo.offsetLeft;
+            top = activeVideo.offsetTop;
+        } else if (Number.isNaN(left) || Number.isNaN(top)) {
+            left = activeVideo.offsetLeft;
+            top = activeVideo.offsetTop;
+        }
+        const vTransform = st.transform || "";
 
         if (left !== cachedLeft) {
             glCanvas.style.left = left + "px";
@@ -868,8 +1262,8 @@ void main() {
         const maxScale = (vw > 0 && vh > 0)
             ? Math.min(1, Math.max(vw / physW, vh / physH))
             : 1;
-        const targetW = Math.max(1, Math.round(physW * maxScale));
-        const targetH = Math.max(1, Math.round(physH * maxScale));
+        let targetW = Math.max(1, Math.round(physW * maxScale));
+        let targetH = Math.max(1, Math.round(physH * maxScale));
 
         // Compute object-fit mapping: cover uses UV scale; contain uses sub-viewport (no black-bar shading)
         uvScaleX = 1.0;
@@ -877,34 +1271,45 @@ void main() {
         uvContain = false;
         vpX = 0;
         vpY = 0;
-        vpW = targetW;
-        vpH = targetH;
 
         if (vw > 0 && vh > 0) {
             const vidAR = vw / vh;
             const boxAR = cssW / cssH;
             if (Math.abs(vidAR - boxAR) > 0.01) {
-                const fit = getComputedStyle(activeVideo).objectFit;
-                if (fit === "cover") {
+                if (!cachedObjectFit) {
+                    cachedObjectFit = getComputedStyle(activeVideo).objectFit || "fill";
+                }
+                if (cachedObjectFit === "cover") {
                     if (vidAR > boxAR) {
                         uvScaleX = boxAR / vidAR;
                     } else {
                         uvScaleY = vidAR / boxAR;
                     }
-                } else if (fit === "contain") {
+                } else if (cachedObjectFit === "contain") {
                     uvContain = true;
-                    if (vidAR > boxAR) {
-                        vpH = Math.max(1, Math.round(targetW / vidAR));
-                        vpY = Math.round((targetH - vpH) * 0.5);
-                    } else {
-                        vpW = Math.max(1, Math.round(targetH * vidAR));
-                        vpX = Math.round((targetW - vpW) * 0.5);
-                    }
                 }
+            } else {
+                // Clamp fractional-DPR rounding overflow (e.g. 1921x1080 -> 1920x1080) for crisp 1:1 texels
+                targetW = Math.min(targetW, vw);
+                targetH = Math.min(targetH, vh);
             }
         }
 
-        if (gl && progPass3 && (uvScaleX !== lastUploadedUvScaleX || uvScaleY !== lastUploadedUvScaleY)) {
+        vpW = targetW;
+        vpH = targetH;
+        if (uvContain && vw > 0 && vh > 0) {
+            const vidAR = vw / vh;
+            const boxAR = cssW / cssH;
+            if (vidAR > boxAR) {
+                vpH = Math.max(1, Math.round(targetW / vidAR));
+                vpY = Math.round((targetH - vpH) * 0.5);
+            } else {
+                vpW = Math.max(1, Math.round(targetH * vidAR));
+                vpX = Math.round((targetW - vpW) * 0.5);
+            }
+        }
+
+        if (gl && programsReady && progPass3 && (uvScaleX !== lastUploadedUvScaleX || uvScaleY !== lastUploadedUvScaleY)) {
             gl.useProgram(progPass3);
             gl.uniform2f(locUvScale, uvScaleX, uvScaleY);
             lastUploadedUvScaleX = uvScaleX;
@@ -928,7 +1333,7 @@ void main() {
     }
 
     function redrawDisplayOnly(video) {
-        if (!gl || isContextLost || webglFailed || !progPass3 || !video || video.readyState < 2) return;
+        if (!gl || isContextLost || webglFailed || !programsReady || !progPass3 || !video || video.readyState < 2) return;
         try {
             gl.activeTexture(gl.TEXTURE0);
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
@@ -970,7 +1375,14 @@ void main() {
             if (!syncCanvasLayout()) return !webglFailed;
         }
 
-        if (!gl || !progPass1 || !progPass2 || !progPass3) {
+        if (!gl || !progPass1 || !progPass2a || !progPass2b || !progPass3) {
+            return !webglFailed;
+        }
+
+        if (!checkProgramsReady()) {
+            if (allowWhenPaused && !webglFailed) {
+                scheduleCompilePoll();
+            }
             return !webglFailed;
         }
 
@@ -992,13 +1404,19 @@ void main() {
             gl.useProgram(progPass1);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-            // --- PASS 2: 1x1 RGBA32UI detector + scene-cut + strobe guard ---
-            // Unit 1 = downTex[downWriteIdx], Unit 2 = stateTex[stateReadIdx] (already bound!)
+            // --- PASS 2a: 8x3 parallel tile reduction (24 threads x 4x6 texels -> 3x RGBA32UI MRT) ---
             gl.activeTexture(gl.TEXTURE1);
             gl.bindTexture(gl.TEXTURE_2D, downTex[downWriteIdx]);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, tileFbo);
+            gl.viewport(0, 0, 8, 3);
+            gl.useProgram(progPass2a);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+            // --- PASS 2b: 1x1 RGBA32UI detector + SIMD 24-tile merge + scene-cut + strobe guard ---
+            // Unit 2 = stateTex[stateReadIdx], Units 3..5 = tileTex[0..2] (permanently bound!)
             gl.bindFramebuffer(gl.FRAMEBUFFER, stateFbo[stateWriteIdx]);
             gl.viewport(0, 0, 1, 1);
-            gl.useProgram(progPass2);
+            gl.useProgram(progPass2b);
             gl.uniform1f(locDtMs, dtMs);
 
             const resetInt = needsStateReset ? 1 : 0;
@@ -1050,25 +1468,31 @@ void main() {
         return Boolean(v && v.isConnected && !v.closest("[hidden]"));
     }
 
-    function getMainVideo() {
-        const selectors = isShortsPage()
-            ? [
-                "#shorts-player video.html5-main-video",
-                "ytd-miniplayer[active] video.html5-main-video",
-                "#movie_player video.html5-main-video"
-            ]
-            : [
-                "ytd-watch-flexy:not([hidden]) #movie_player video.html5-main-video",
-                "#movie_player video.html5-main-video",
-                "ytd-miniplayer[active] video.html5-main-video",
-                "#shorts-player video.html5-main-video"
-            ];
+    function findVisibleVideoById(id) {
+        const root = document.getElementById(id);
+        if (!root) return null;
+        const v = root.querySelector("video.html5-main-video");
+        return isVideoVisibleInDom(v) ? v : null;
+    }
 
-        for (let i = 0; i < selectors.length; i++) {
-            const v = document.querySelector(selectors[i]);
-            if (isVideoVisibleInDom(v)) return v;
+    function getMainVideo() {
+        if (isShortsPage()) {
+            const sv = findVisibleVideoById("shorts-player");
+            if (sv) return sv;
+            const mini = document.querySelector("ytd-miniplayer[active] video.html5-main-video");
+            if (isVideoVisibleInDom(mini)) return mini;
+            return findVisibleVideoById("movie_player");
         }
-        return null;
+
+        const mp = findVisibleVideoById("movie_player");
+        if (mp) return mp;
+        if (isWatchPage()) {
+            const watchV = document.querySelector("ytd-watch-flexy:not([hidden]) #movie_player video.html5-main-video");
+            if (isVideoVisibleInDom(watchV)) return watchV;
+        }
+        const mini = document.querySelector("ytd-miniplayer[active] video.html5-main-video");
+        if (isVideoVisibleInDom(mini)) return mini;
+        return findVisibleVideoById("shorts-player");
     }
 
     function clearVideoFilter(video) {
@@ -1135,7 +1559,7 @@ void main() {
         ) {
             return;
         }
-        if (typeof video.requestVideoFrameCallback === "function") {
+        if (videoSupportsVfc) {
             isUsingVfc = true;
             frameHandle = video.requestVideoFrameCallback(onFrameCallback);
         } else {
@@ -1188,6 +1612,7 @@ void main() {
     }
 
     function stopAutoPipeline(freeVram) {
+        cancelCompilePoll();
         cancelFrameLoop();
         if (layoutRafId !== null) {
             cancelAnimationFrame(layoutRafId);
@@ -1238,6 +1663,7 @@ void main() {
         cachedLeft = NaN;
         cachedTop = NaN;
         cachedTransform = "";
+        cachedObjectFit = "";
         cachedVideoW = 0;
         cachedVideoH = 0;
         lastInlineW = "";
@@ -1261,18 +1687,19 @@ void main() {
             activeVideo.removeEventListener("resize", markLayoutDirty);
         }
         if (videoIntersectionObserver) {
-            try { videoIntersectionObserver.disconnect(); } catch {}
+            try { videoIntersectionObserver.disconnect(); } catch { }
             videoIntersectionObserver = null;
         }
         if (videoResizeObserver) {
-            try { videoResizeObserver.disconnect(); } catch {}
+            try { videoResizeObserver.disconnect(); } catch { }
             videoResizeObserver = null;
         }
         if (videoStyleObserver) {
-            try { videoStyleObserver.disconnect(); } catch {}
+            try { videoStyleObserver.disconnect(); } catch { }
             videoStyleObserver = null;
         }
         activeVideo = null;
+        videoSupportsVfc = false;
         webglFailed = false;
         isIntersecting = true;
         resetLayoutCaches();
@@ -1298,6 +1725,7 @@ void main() {
 
         unbindVideo();
         activeVideo = video;
+        videoSupportsVfc = typeof video.requestVideoFrameCallback === "function";
         webglFailed = false;
         needsStateReset = true;
         lastFrameTime = 0;
@@ -1348,8 +1776,7 @@ void main() {
         try {
             videoResizeObserver = new ResizeObserver(markLayoutDirty);
             videoResizeObserver.observe(video);
-            if (video.parentElement) videoResizeObserver.observe(video.parentElement);
-        } catch {}
+        } catch { }
 
         try {
             videoStyleObserver = new MutationObserver(() => {
@@ -1371,7 +1798,7 @@ void main() {
                 }
             });
             videoStyleObserver.observe(video, { attributes: true, attributeFilter: ["style"] });
-        } catch {}
+        } catch { }
 
         applyFilterState();
     }
@@ -1379,10 +1806,14 @@ void main() {
     // --- UI: Button, Tooltip & Fixed-Portal Settings Popup (Trusted Types Safe, Cached Refs) ---
     function updateButtonAppearance() {
         if (!btnEl) return;
-        const modeLabel = currentMode === "manual" ? "Manual" : "Auto • WebGL2";
+        const key = (isEnabled ? "1" : "0") + "|" + currentMode + "|" + (isPopupOpen ? "1" : "0");
+        if (key === lastBtnStateKey) return;
+        lastBtnStateKey = key;
+
+        const modeLabel = currentMode === "manual" ? "Manual" : "Auto";
         btnEl.setAttribute("aria-pressed", isEnabled ? "true" : "false");
         btnEl.setAttribute("aria-expanded", isPopupOpen ? "true" : "false");
-        if (dotEl) dotEl.style.display = isEnabled ? "block" : "none";
+        if (wrapperEl) wrapperEl.dataset.popupOpen = isPopupOpen ? "true" : "false";
         if (tooltipEl) {
             const stateLabel = isEnabled ? "ON" : "OFF";
             tooltipEl.textContent = `Flashbang Defender: ${stateLabel} (${modeLabel}) • Right-click for settings`;
@@ -1395,8 +1826,6 @@ void main() {
         if (powerPillEl) {
             powerPillEl.textContent = isEnabled ? "ON" : "OFF";
             powerPillEl.setAttribute("aria-pressed", isEnabled ? "true" : "false");
-            powerPillEl.style.backgroundColor = isEnabled ? "rgba(0, 230, 118, 0.18)" : "rgba(255, 255, 255, 0.1)";
-            powerPillEl.style.color = isEnabled ? "#00e676" : "rgba(255, 255, 255, 0.65)";
         }
 
         const opts = [optAutoEl, optManualEl];
@@ -1406,8 +1835,6 @@ void main() {
             const isActive = opt.dataset.mode === currentMode;
             opt.dataset.active = isActive ? "true" : "false";
             opt.setAttribute("aria-checked", isActive ? "true" : "false");
-            opt.style.backgroundColor = isActive ? "rgba(255, 255, 255, 0.08)" : "transparent";
-            if (opt._checkEl) opt._checkEl.style.opacity = isActive ? "1" : "0";
         }
 
         const pct = Math.round(manualGain * 100);
@@ -1420,8 +1847,7 @@ void main() {
             sliderValEl.textContent = pct + "%";
         }
         if (sliderContEl) {
-            sliderContEl.style.opacity = currentMode === "manual" ? "1" : "0.4";
-            sliderContEl.style.pointerEvents = currentMode === "manual" ? "auto" : "none";
+            sliderContEl.dataset.disabled = currentMode === "manual" ? "false" : "true";
         }
     }
 
@@ -1436,32 +1862,13 @@ void main() {
             return popupEl;
         }
 
+        ensureStyles();
         document.getElementById("yt-flashbang-defender-popup")?.remove();
 
         const popup = document.createElement("div");
         popup.id = "yt-flashbang-defender-popup";
         popup.setAttribute("role", "dialog");
         popup.setAttribute("aria-label", "Flashbang Defender Settings");
-        popup.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 232px;
-            background-color: rgba(28, 28, 28, 0.98);
-            color: #ffffff;
-            font-family: "Roboto", "Arial", sans-serif;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 12px;
-            padding: 8px 6px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
-            backdrop-filter: blur(8px);
-            z-index: 2147483647;
-            display: none;
-            flex-direction: column;
-            gap: 2px;
-            user-select: none;
-            box-sizing: border-box;
-        `;
 
         popup.addEventListener("click", (e) => e.stopPropagation());
         popup.addEventListener("contextmenu", (e) => {
@@ -1470,39 +1877,15 @@ void main() {
         });
 
         const header = document.createElement("div");
-        header.style.cssText = `
-            padding: 4px 10px 6px 10px;
-            font-size: 11px;
-            font-weight: 500;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: rgba(255, 255, 255, 0.55);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-            margin-bottom: 4px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-        `;
+        header.className = "yt-fbd-popup-header";
 
         const headerTitle = document.createElement("span");
-        headerTitle.textContent = "Defender • WebGL2";
+        headerTitle.textContent = "Flashbang Defender";
 
         powerPillEl = document.createElement("button");
         powerPillEl.id = "yt-fbd-power-pill";
         powerPillEl.type = "button";
         powerPillEl.setAttribute("aria-label", "Toggle Flashbang Defender");
-        powerPillEl.style.cssText = `
-            border: none;
-            border-radius: 999px;
-            padding: 2px 8px;
-            font-family: inherit;
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 0.4px;
-            cursor: pointer;
-            transition: background-color 0.15s ease, color 0.15s ease;
-        `;
         powerPillEl.addEventListener("click", () => {
             isEnabled = !isEnabled;
             webglFailed = false;
@@ -1515,8 +1898,8 @@ void main() {
         popup.appendChild(header);
 
         const modeGroup = document.createElement("div");
+        modeGroup.className = "yt-fbd-mode-group";
         modeGroup.setAttribute("role", "menu");
-        modeGroup.style.cssText = `display: flex; flex-direction: column; gap: 2px;`;
 
         function createOption(modeKey, titleText, descText) {
             const item = document.createElement("button");
@@ -1524,32 +1907,16 @@ void main() {
             item.className = "yt-fbd-popup-opt";
             item.dataset.mode = modeKey;
             item.setAttribute("role", "menuitemradio");
-            item.style.cssText = `
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                width: 100%;
-                padding: 8px 10px;
-                border: none;
-                border-radius: 8px;
-                background: transparent;
-                color: inherit;
-                font-family: inherit;
-                text-align: left;
-                cursor: pointer;
-                transition: background-color 0.15s ease;
-                box-sizing: border-box;
-            `;
 
             const textCol = document.createElement("span");
-            textCol.style.cssText = `display: flex; flex-direction: column; gap: 2px;`;
+            textCol.className = "yt-fbd-opt-text";
 
             const title = document.createElement("span");
-            title.style.cssText = `font-size: 13px; font-weight: 500; color: #ffffff;`;
+            title.className = "yt-fbd-opt-title";
             title.textContent = titleText;
 
             const desc = document.createElement("span");
-            desc.style.cssText = `font-size: 11px; color: rgba(255, 255, 255, 0.6);`;
+            desc.className = "yt-fbd-opt-desc";
             desc.textContent = descText;
 
             textCol.append(title, desc);
@@ -1558,26 +1925,8 @@ void main() {
             const check = document.createElement("span");
             check.className = "yt-fbd-opt-check";
             check.setAttribute("aria-hidden", "true");
-            check.style.cssText = `
-                font-size: 14px;
-                font-weight: 700;
-                color: #00e676;
-                margin-left: 8px;
-                opacity: 0;
-                transition: opacity 0.15s ease;
-            `;
             check.textContent = "✓";
             item.appendChild(check);
-            item._checkEl = check;
-
-            item.addEventListener("mouseenter", () => {
-                item.style.backgroundColor = "rgba(255, 255, 255, 0.12)";
-            });
-            item.addEventListener("mouseleave", () => {
-                item.style.backgroundColor = item.dataset.active === "true"
-                    ? "rgba(255, 255, 255, 0.08)"
-                    : "transparent";
-            });
 
             item.addEventListener("click", () => {
                 currentMode = modeKey;
@@ -1597,30 +1946,16 @@ void main() {
             return item;
         }
 
-        optAutoEl = createOption("auto", "Automatic", "0-frame GPU + scene-cut");
+        optAutoEl = createOption("auto", "Automatic", "0-frame GPU shader + scene-cut");
         optManualEl = createOption("manual", "Manual", "Static brightness filter");
         modeGroup.append(optAutoEl, optManualEl);
         popup.appendChild(modeGroup);
 
         sliderContEl = document.createElement("div");
         sliderContEl.id = "yt-fbd-slider-container";
-        sliderContEl.style.cssText = `
-            margin-top: 6px;
-            padding: 6px 10px 4px 10px;
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-            transition: opacity 0.2s ease;
-        `;
 
         const sliderHeader = document.createElement("div");
-        sliderHeader.style.cssText = `
-            display: flex;
-            justify-content: space-between;
-            font-size: 11px;
-            color: rgba(255, 255, 255, 0.7);
-        `;
+        sliderHeader.className = "yt-fbd-slider-header";
 
         const sliderLabel = document.createElement("label");
         sliderLabel.htmlFor = "yt-fbd-slider-input";
@@ -1628,8 +1963,6 @@ void main() {
 
         sliderValEl = document.createElement("span");
         sliderValEl.id = "yt-fbd-slider-val";
-        sliderValEl.style.fontWeight = "600";
-        sliderValEl.style.color = "#00e676";
 
         sliderHeader.append(sliderLabel, sliderValEl);
         sliderContEl.appendChild(sliderHeader);
@@ -1641,12 +1974,6 @@ void main() {
         sliderInputEl.max = String(Math.round(MAX_MANUAL_GAIN * 100));
         sliderInputEl.step = "5";
         sliderInputEl.setAttribute("aria-label", "Manual brightness percentage");
-        sliderInputEl.style.cssText = `
-            width: 100%;
-            margin: 4px 0 2px 0;
-            accent-color: #00e676;
-            cursor: pointer;
-        `;
 
         sliderInputEl.addEventListener("input", (e) => {
             const pct = parseInt(e.target.value, 10);
@@ -1739,13 +2066,8 @@ void main() {
         const popup = createOrGetPopup();
         positionPopup(popup, btnEl);
         isPopupOpen = true;
-        btnEl.setAttribute("aria-expanded", "true");
+        updateButtonAppearance();
         attachPopupDismissListeners();
-
-        if (tooltipEl) {
-            tooltipEl.style.opacity = "0";
-            tooltipEl.style.visibility = "hidden";
-        }
     }
 
     function closePopup(restoreFocus) {
@@ -1755,10 +2077,10 @@ void main() {
         if (isPopupOpen) {
             isPopupOpen = false;
             detachPopupDismissListeners();
+            updateButtonAppearance();
         }
-        if (btnEl) {
-            btnEl.setAttribute("aria-expanded", "false");
-            if (restoreFocus) btnEl.focus();
+        if (btnEl && restoreFocus) {
+            btnEl.focus();
         }
     }
 
@@ -1777,21 +2099,25 @@ void main() {
 
     // --- Watch Page Button Mounting ---
     function findLikeDislikeContainer() {
-        return (
-            document.querySelector(
-                "ytd-watch-metadata #top-level-buttons-computed segmented-like-dislike-button-view-model, " +
-                "ytd-watch-metadata ytd-segmented-like-dislike-button-renderer"
-            ) ||
-            document.querySelector(
-                "ytd-watch-flexy:not([hidden]) segmented-like-dislike-button-view-model, " +
-                "ytd-watch-flexy:not([hidden]) ytd-segmented-like-dislike-button-renderer"
-            )
+        const topBar = document.getElementById("top-level-buttons-computed");
+        if (topBar && !topBar.closest("[hidden]")) {
+            const seg = topBar.querySelector(
+                "segmented-like-dislike-button-view-model, ytd-segmented-like-dislike-button-renderer"
+            );
+            if (seg) return seg;
+        }
+        return document.querySelector(
+            "ytd-watch-metadata segmented-like-dislike-button-view-model, " +
+            "ytd-watch-metadata ytd-segmented-like-dislike-button-renderer, " +
+            "ytd-watch-flexy:not([hidden]) segmented-like-dislike-button-view-model, " +
+            "ytd-watch-flexy:not([hidden]) ytd-segmented-like-dislike-button-renderer"
         );
     }
 
     function disconnectActionBarObserver() {
+        actionBarSyncQueued = false;
         if (actionBarObserver) {
-            try { actionBarObserver.disconnect(); } catch {}
+            try { actionBarObserver.disconnect(); } catch { }
             actionBarObserver = null;
             observedActionBar = null;
         }
@@ -1806,9 +2132,23 @@ void main() {
                 disconnectActionBarObserver();
                 return;
             }
-            if (!wrapperEl || !wrapperEl.isConnected) {
-                insertButton();
-            }
+            if (actionBarSyncQueued) return;
+            actionBarSyncQueued = true;
+            queueMicrotask(() => {
+                actionBarSyncQueued = false;
+                if (!isWatchPage()) {
+                    disconnectActionBarObserver();
+                    return;
+                }
+                if (!wrapperEl || !wrapperEl.isConnected) {
+                    insertButton();
+                } else {
+                    const seg = findLikeDislikeContainer();
+                    if (seg && wrapperEl.previousElementSibling !== seg) {
+                        seg.after(wrapperEl);
+                    }
+                }
+            });
         });
         actionBarObserver.observe(parent, { childList: true });
     }
@@ -1819,6 +2159,7 @@ void main() {
         const segmented = findLikeDislikeContainer();
         if (!segmented || !segmented.parentElement) return false;
 
+        ensureStyles();
         observeActionBar(segmented.parentElement);
 
         if (wrapperEl && wrapperEl.isConnected) {
@@ -1833,15 +2174,6 @@ void main() {
 
         wrapperEl = document.createElement("div");
         wrapperEl.id = "yt-flashbang-defender-wrapper";
-        wrapperEl.style.cssText = `
-            position: relative;
-            display: inline-flex;
-            align-items: center;
-            margin: 0 8px;
-            flex-shrink: 0;
-            vertical-align: middle;
-            height: 40px;
-        `;
 
         btnEl = document.createElement("button");
         btnEl.id = "yt-flashbang-defender-btn";
@@ -1849,23 +2181,6 @@ void main() {
         btnEl.setAttribute("aria-label", "Flashbang Defender");
         btnEl.setAttribute("aria-haspopup", "dialog");
         btnEl.setAttribute("aria-expanded", "false");
-        btnEl.style.cssText = `
-            position: relative;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 40px;
-            height: 40px;
-            border-radius: 20px;
-            border: none;
-            background-color: var(--yt-spec-badge-chip-background, rgba(255, 255, 255, 0.1));
-            color: var(--yt-spec-text-primary, currentColor);
-            cursor: pointer;
-            padding: 0;
-            margin: 0;
-            box-sizing: border-box;
-            transition: background-color 0.2s;
-        `;
 
         const svgNS = "http://www.w3.org/2000/svg";
         const svg = document.createElementNS(svgNS, "svg");
@@ -1888,58 +2203,13 @@ void main() {
         dotEl = document.createElement("span");
         dotEl.id = "yt-fbd-green-dot";
         dotEl.setAttribute("aria-hidden", "true");
-        dotEl.style.cssText = `
-            position: absolute;
-            top: 6px;
-            right: 6px;
-            width: 5px;
-            height: 5px;
-            border-radius: 50%;
-            background-color: #00e676;
-            box-shadow: 0 0 3px rgba(0, 230, 118, 0.7);
-            pointer-events: none;
-        `;
         btnEl.appendChild(dotEl);
 
         tooltipEl = document.createElement("div");
         tooltipEl.id = "yt-flashbang-defender-tooltip";
         tooltipEl.setAttribute("role", "tooltip");
-        tooltipEl.style.cssText = `
-            position: absolute;
-            bottom: calc(100% + 10px);
-            left: 50%;
-            transform: translateX(-50%);
-            background-color: rgba(97, 97, 97, 0.95);
-            color: #ffffff;
-            font-family: "Roboto", "Arial", sans-serif;
-            font-size: 12px;
-            line-height: 16px;
-            font-weight: 400;
-            padding: 6px 10px;
-            border-radius: 4px;
-            white-space: nowrap;
-            pointer-events: none;
-            opacity: 0;
-            visibility: hidden;
-            transition: opacity 0.15s ease-in-out, visibility 0.15s;
-            z-index: 99999;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
-        `;
 
         wrapperEl.append(btnEl, tooltipEl);
-
-        wrapperEl.addEventListener("mouseenter", () => {
-            if (!isPopupOpen) {
-                tooltipEl.style.visibility = "visible";
-                tooltipEl.style.opacity = "1";
-            }
-            btnEl.style.backgroundColor = "var(--yt-spec-button-chip-background-hover, rgba(255, 255, 255, 0.2))";
-        });
-        wrapperEl.addEventListener("mouseleave", () => {
-            tooltipEl.style.opacity = "0";
-            tooltipEl.style.visibility = "hidden";
-            btnEl.style.backgroundColor = "var(--yt-spec-badge-chip-background, rgba(255, 255, 255, 0.1))";
-        });
 
         btnEl.addEventListener("click", (e) => {
             e.preventDefault();
@@ -1958,6 +2228,7 @@ void main() {
             togglePopup();
         });
 
+        lastBtnStateKey = "";
         updateButtonAppearance();
         segmented.after(wrapperEl);
         return true;
@@ -1986,15 +2257,26 @@ void main() {
     }
 
     function onNavigate() {
-        closePopup(false);
-        if (!isWatchPage()) {
-            disconnectActionBarObserver();
+        const href = location.href;
+        const urlChanged = href !== lastNavUrl;
+        lastNavUrl = href;
+
+        if (!urlChanged) {
+            // Non-navigation yt-player-updated / yt-page-data-updated: skip if already cleanly mounted
+            if (isVideoVisibleInDom(activeVideo) && (!isWatchPage() || (wrapperEl && wrapperEl.isConnected))) {
+                return;
+            }
+        } else {
+            closePopup(false);
+            if (!isWatchPage()) {
+                disconnectActionBarObserver();
+            }
+            webglFailed = false;
+            needsStateReset = true;
+            lastFrameTime = 0;
+            lastPresentedFrames = -1;
+            lastVideoTime = -1;
         }
-        webglFailed = false;
-        needsStateReset = true;
-        lastFrameTime = 0;
-        lastPresentedFrames = -1;
-        lastVideoTime = -1;
 
         clearTimeout(navTimer);
         navTimer = setTimeout(() => {
@@ -2013,8 +2295,7 @@ void main() {
             ensureMountedWithRetry(8, 200);
         }
         if (isEnabled && currentMode === "auto" && activeVideo && !webglFailed && !isContextLost) {
-            layoutDirty = true;
-            if (activeVideo.paused && hasRenderedFrame) {
+            if (activeVideo.paused && layoutDirty && hasRenderedFrame) {
                 syncCanvasLayout();
             } else {
                 scheduleNextFrame(activeVideo);
@@ -2023,11 +2304,8 @@ void main() {
     }
 
     function onFullscreenChange() {
+        cachedObjectFit = "";
         markLayoutDirty();
-        clearTimeout(fsTimer1);
-        clearTimeout(fsTimer2);
-        fsTimer1 = setTimeout(() => { fsTimer1 = null; markLayoutDirty(); }, 60);
-        fsTimer2 = setTimeout(() => { fsTimer2 = null; markLayoutDirty(); }, 220);
     }
 
     function stopAll() {
@@ -2036,27 +2314,32 @@ void main() {
         closePopup(false);
 
         if (popupEl) {
-            try { popupEl.remove(); } catch {}
+            try { popupEl.remove(); } catch { }
             popupEl = null;
         }
         powerPillEl = optAutoEl = optManualEl = sliderContEl = sliderInputEl = sliderValEl = null;
 
         if (wrapperEl) {
-            try { wrapperEl.remove(); } catch {}
+            try { wrapperEl.remove(); } catch { }
             wrapperEl = null;
         }
         btnEl = dotEl = tooltipEl = null;
+        lastBtnStateKey = "";
+
+        if (styleEl) {
+            try { styleEl.remove(); } catch { }
+            styleEl = null;
+        }
 
         document.getElementById("yt-flashbang-defender-wrapper")?.remove();
         document.getElementById("yt-fbd-webgl-canvas")?.remove();
+        document.getElementById("yt-fbd-styles")?.remove();
 
         disconnectActionBarObserver();
 
         clearTimeout(navTimer);
         clearTimeout(mountRetryTimer);
-        clearTimeout(fsTimer1);
-        clearTimeout(fsTimer2);
-        navTimer = mountRetryTimer = fsTimer1 = fsTimer2 = null;
+        navTimer = mountRetryTimer = null;
 
         document.removeEventListener("visibilitychange", onVisibilityChange);
         document.removeEventListener("fullscreenchange", onFullscreenChange);
@@ -2079,6 +2362,7 @@ void main() {
     document.getElementById("yt-flashbang-defender-wrapper")?.remove();
     document.getElementById("yt-flashbang-defender-popup")?.remove();
     document.getElementById("yt-fbd-webgl-canvas")?.remove();
+    document.getElementById("yt-fbd-styles")?.remove();
 
     ensureMountedWithRetry(16, 150);
 })();
