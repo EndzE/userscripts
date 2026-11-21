@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Commenter Subscribers
 // @namespace    https://github.com/EndzE
-// @version      1.5.24
+// @version      1.6.0
 // @description  Displays the commenter's subscriber count next to their username on YouTube.
 // @author       EndzE
 // @license      MIT
@@ -23,7 +23,7 @@
   'use strict';
 
   const DEBUG = false;
-  const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '1.5.24';
+  const version = typeof GM_info !== 'undefined' ? GM_info?.script?.version : '1.6.0';
   if (DEBUG) console.log(`[Commenter Subscribers] Initializing v${version}`);
 
   const css = `
@@ -107,8 +107,58 @@
   const MAX_STORAGE_ENTRIES = 1000;
   const pendingCache = new Map();
   const storageCache = new Map();
-  let isDirty = false;
+  const dirtyKeys = new Map();
   let saveTimer = null;
+  let idleId = null;
+
+  /**
+   * Normalizes a channel URL or path into a canonical short path (/@handle lowercased or /channel/UC...).
+   * @param {string} rawUrl
+   * @returns {string}
+   */
+  const normalizeChannelPath = (rawUrl) => {
+    if (!rawUrl) return '';
+    try {
+      const origin = location.origin;
+      let path = rawUrl.startsWith(origin)
+        ? rawUrl.slice(origin.length)
+        : rawUrl.replace(/^https?:\/\/[^/]+/, '');
+      const qIdx = path.indexOf('?');
+      if (qIdx !== -1) path = path.slice(0, qIdx);
+      const hIdx = path.indexOf('#');
+      if (hIdx !== -1) path = path.slice(0, hIdx);
+      try {
+        path = decodeURIComponent(path);
+      } catch { }
+      while (path.endsWith('/') && path.length > 1) {
+        path = path.slice(0, -1);
+      }
+      if (path.startsWith('/@')) {
+        path = '/@' + path.slice(2).toLowerCase();
+      }
+      return path;
+    } catch {
+      return rawUrl;
+    }
+  };
+
+  /**
+   * Fast channel URL & handle normalizer with decodeURIComponent and case-normalization.
+   * @param {string} rawUrl
+   * @returns {string}
+   */
+  const normalizeChannelUrl = (rawUrl) => {
+    const path = normalizeChannelPath(rawUrl);
+    if (!path) return '';
+    return path.startsWith('/') ? location.origin + path : path;
+  };
+
+  const normalizeStorageKey = (key) => {
+    if (key.startsWith('http://') || key.startsWith('https://')) {
+      return normalizeChannelPath(key);
+    }
+    return key;
+  };
 
   // Helper to read persistent GM / localStorage
   const readPersistentStorage = () => {
@@ -132,7 +182,7 @@
       } else {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
       }
-    } catch {}
+    } catch { }
   };
 
   // Safe cache accessor that verifies TTL
@@ -147,9 +197,9 @@
     return entry.val;
   };
 
-  // Cache setter with LRU refresh, size capping and dirty-flag tracking
-  const setCachedValue = (canonicalId, channelUrl, val, customTtl) => {
-    if (val === undefined || (!canonicalId && !channelUrl)) return;
+  // Cache setter with LRU refresh, size capping and dirty-key tracking
+  const setCachedValue = (canonicalId, channelPath, val, customTtl) => {
+    if (val === undefined || (!canonicalId && !channelPath)) return;
     const ttl = val === ERROR ? ERROR_TTL_MS : (customTtl || CACHE_TTL_MS);
     const exp = Date.now() + ttl;
     const entry = { val, exp };
@@ -158,9 +208,9 @@
       storageCache.delete(canonicalId);
       storageCache.set(canonicalId, entry);
     }
-    if (channelUrl && channelUrl !== canonicalId) {
-      storageCache.delete(channelUrl);
-      storageCache.set(channelUrl, entry);
+    if (channelPath && channelPath !== canonicalId) {
+      storageCache.delete(channelPath);
+      storageCache.set(channelPath, entry);
     }
 
     // Evict oldest in-memory entries if exceeding bounds (capped at MAX_STORAGE_ENTRIES * 2 for dual keys)
@@ -170,96 +220,145 @@
     }
 
     if (val !== ERROR) {
+      const persistKey = canonicalId || channelPath;
+      dirtyKeys.set(persistKey, [val, Math.ceil(exp / 1000)]);
       persistCache();
     }
   };
 
-  // Hydrate L1 cache from persistent storage with TTL filtering and backward-compatible migration
+  // Hydrate L1 cache from persistent storage (supports compact tuples, legacy objects, and string aliases)
   try {
-    const now = Date.now();
+    const nowMs = Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
     const stored = readPersistentStorage();
     if (stored && typeof stored === 'object') {
-      for (const [k, item] of Object.entries(stored)) {
-        if (item && typeof item === 'object' && item.exp > now && item.val !== ERROR) {
-          storageCache.set(k, item);
+      for (const [rawKey, item] of Object.entries(stored)) {
+        const key = normalizeStorageKey(rawKey);
+        if (Array.isArray(item)) {
+          if (item.length >= 2 && typeof item[1] === 'number' && item[1] > nowSec && item[0] !== ERROR) {
+            storageCache.set(key, { val: item[0], exp: item[1] * 1000 });
+          }
+        } else if (item && typeof item === 'object' && item.exp > nowMs && item.val !== ERROR) {
+          storageCache.set(key, item);
         }
       }
       // Migrate legacy string aliases from previous schema
-      for (const [k, item] of Object.entries(stored)) {
-        if (typeof item === 'string' && storageCache.has(item)) {
-          storageCache.set(k, storageCache.get(item));
+      for (const [rawKey, item] of Object.entries(stored)) {
+        if (typeof item === 'string') {
+          const targetKey = normalizeStorageKey(item);
+          if (storageCache.has(targetKey)) {
+            storageCache.set(normalizeStorageKey(rawKey), storageCache.get(targetKey));
+          }
         }
       }
     }
-  } catch {}
+  } catch { }
 
   const cancelSaveTimer = () => {
     if (saveTimer !== null) {
       clearTimeout(saveTimer);
       saveTimer = null;
     }
+    if (idleId !== null && typeof cancelIdleCallback === 'function') {
+      cancelIdleCallback(idleId);
+      idleId = null;
+    }
   };
 
-  // Flushes dirty cache to persistent storage, merging with latest storage to prevent cross-tab overwrite
+  // Flushes dirty keys to persistent storage, merging with latest storage to prevent cross-tab overwrite
   const flushStorage = () => {
     cancelSaveTimer();
-    if (!isDirty) return;
-    isDirty = false;
+    if (dirtyKeys.size === 0) return;
+    const pendingDirty = new Map(dirtyKeys);
+    dirtyKeys.clear();
     try {
-      const now = Date.now();
+      const nowMs = Date.now();
+      const nowSec = Math.floor(nowMs / 1000);
       const stored = readPersistentStorage() || {};
       const merged = new Map();
 
-      // 1. Merge existing valid storage entries
-      for (const [k, item] of Object.entries(stored)) {
-        if (item && typeof item === 'object' && item.exp > now && item.val !== ERROR) {
-          merged.set(k, item);
+      // 1. Merge existing valid storage entries, compacting legacy objects on the fly
+      for (const [rawKey, item] of Object.entries(stored)) {
+        const key = normalizeStorageKey(rawKey);
+        if (Array.isArray(item)) {
+          if (item.length >= 2 && typeof item[1] === 'number' && item[1] > nowSec && item[0] !== ERROR) {
+            merged.set(key, [item[0], item[1]]);
+          }
+        } else if (item && typeof item === 'object' && item.exp > nowMs && item.val !== ERROR) {
+          merged.set(key, [item.val, Math.ceil(item.exp / 1000)]);
         }
       }
 
-      // 2. Merge current tab's cache (overriding if newer and refreshing LRU order)
-      for (const [k, entry] of storageCache.entries()) {
-        if (entry.exp > now && entry.val !== ERROR) {
-          merged.delete(k);
-          merged.set(k, entry);
-        }
+      // 2. Apply only dirty entries from this tab (refreshing LRU order)
+      for (const [key, compactEntry] of pendingDirty.entries()) {
+        merged.delete(key);
+        merged.set(key, compactEntry);
       }
 
-      // 3. Keep newest entries up to MAX_STORAGE_ENTRIES * 2
-      const entries = Array.from(merged.entries()).slice(-MAX_STORAGE_ENTRIES * 2);
-      const payload = Object.fromEntries(entries);
-      writePersistentStorage(payload);
-    } catch {}
+      // 3. Keep newest entries up to MAX_STORAGE_ENTRIES
+      const entries = Array.from(merged.entries()).slice(-MAX_STORAGE_ENTRIES);
+      writePersistentStorage(Object.fromEntries(entries));
+    } catch { }
   };
 
-  // Schedules non-blocking cache persistence via debounce timer
+  // Schedules non-blocking cache persistence via debounce timer + idle callback
   const persistCache = () => {
-    isDirty = true;
-    if (saveTimer !== null) return;
-    saveTimer = setTimeout(flushStorage, 2000);
+    if (dirtyKeys.size === 0 || saveTimer !== null || idleId !== null) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      if (typeof requestIdleCallback === 'function') {
+        idleId = requestIdleCallback(() => {
+          idleId = null;
+          flushStorage();
+        }, { timeout: 5000 });
+      } else {
+        flushStorage();
+      }
+    }, 2500);
   };
 
   // Ensure dirty cache is committed when switching tabs or unloading
   window.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden' && isDirty) {
+    if (document.visibilityState === 'hidden' && dirtyKeys.size > 0) {
       flushStorage();
     }
   });
   window.addEventListener('pagehide', () => {
-    if (isDirty) flushStorage();
+    if (dirtyKeys.size > 0) flushStorage();
   });
 
-  // Safe InnerTube context accessor
+  // Safe minimal cached InnerTube context accessor
+  let cachedContext = null;
+
   const getYtContext = () => {
+    if (cachedContext) return cachedContext;
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    const ytcfgObj = win?.ytcfg;
-    return ytcfgObj?.get
-      ? ytcfgObj.get('INNERTUBE_CONTEXT')
-      : { client: { clientName: 'WEB', clientVersion: '2.20261105.05.01' } };
+    const rawClient = win?.ytcfg?.get?.('INNERTUBE_CONTEXT')?.client;
+    const hl = rawClient?.hl || document.documentElement.lang || 'en';
+    const gl = rawClient?.gl || 'US';
+    if (rawClient?.clientVersion) {
+      cachedContext = {
+        client: {
+          clientName: rawClient.clientName || 'WEB',
+          clientVersion: rawClient.clientVersion,
+          hl,
+          gl,
+        },
+      };
+      return cachedContext;
+    }
+    return {
+      client: {
+        clientName: 'WEB',
+        clientVersion: '2.20261119.07.00',
+        hl,
+        gl,
+      },
+    };
   };
 
-  // Concurrency limiter with LIFO priority scheduling and rate-limit cooldown
-  const MAX_CONCURRENT = 5;
+  // Concurrency limiter with O(1) LIFO priority scheduling and adaptive rate-limit cooldown
+  let maxConcurrent = 10;
   let activeRequests = 0;
   const requestQueue = [];
   let cooldownUntil = 0;
@@ -281,8 +380,9 @@
       cooldownTimer = null;
     }
 
-    while (activeRequests < MAX_CONCURRENT && requestQueue.length > 0) {
-      const item = requestQueue.shift();
+    while (activeRequests < maxConcurrent && requestQueue.length > 0) {
+      const item = requestQueue.pop();
+      if (item.cancelled) continue;
       activeRequests++;
       item.run().finally(() => {
         activeRequests--;
@@ -296,13 +396,8 @@
       return Promise.reject(new DOMException('Aborted', 'AbortError'));
     }
     return new Promise((resolve, reject) => {
-      let item;
-      const onAbort = () => {
-        const idx = requestQueue.indexOf(item);
-        if (idx !== -1) requestQueue.splice(idx, 1);
-        reject(new DOMException('Aborted', 'AbortError'));
-      };
-      item = {
+      const item = {
+        cancelled: false,
         run: () => {
           signal?.removeEventListener('abort', onAbort);
           try {
@@ -314,8 +409,12 @@
           }
         },
       };
+      const onAbort = () => {
+        item.cancelled = true;
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
       signal?.addEventListener('abort', onAbort, { once: true });
-      requestQueue.unshift(item); // LIFO: prioritize currently visible comments
+      requestQueue.push(item); // O(1) LIFO: prioritize currently visible comments
       runQueue();
     });
   };
@@ -427,26 +526,148 @@
     return ERROR;
   };
 
+  // Tiered InnerTube endpoints with $fields projection and protobuf about-channel continuation
+  const ABOUT_CONT_INNER = '8gYFGgOaAQA%3D';
+  const ABOUT_CONT_TAG = [0xe2, 0xa9, 0x85, 0xb2, 0x02];
+  const ABOUT_FIELDS_QUERY = encodeURIComponent(
+    'onResponseReceivedEndpoints/appendContinuationItemsAction/continuationItems/aboutChannelRenderer/metadata/aboutChannelViewModel/subscriberCountText'
+  );
+  const BROWSE_HEADER_FIELDS_QUERY = encodeURIComponent(
+    'header(pageHeaderRenderer/content/pageHeaderViewModel/metadata/contentMetadataViewModel/metadataRows(metadataParts(text/content,accessibilityLabel)),c4TabbedHeaderRenderer/subscriberCountText)'
+  );
+  const RESOLVE_URL_FIELDS_QUERY = encodeURIComponent('endpoint/browseEndpoint/browseId');
+
+  let useAboutContinuation = true;
+  let aboutMissStreak = 0;
+
+  const writeVarint = (buf, n) => {
+    while (n > 0x7f) {
+      buf.push((n & 0x7f) | 0x80);
+      n >>>= 7;
+    }
+    buf.push(n);
+  };
+
+  const buildAboutContinuation = (browseId) => {
+    const msg = [0x12];
+    writeVarint(msg, browseId.length);
+    for (let i = 0; i < browseId.length; i++) {
+      msg.push(browseId.charCodeAt(i) & 0xff);
+    }
+    msg.push(0x1a);
+    writeVarint(msg, ABOUT_CONT_INNER.length);
+    for (let i = 0; i < ABOUT_CONT_INNER.length; i++) {
+      msg.push(ABOUT_CONT_INNER.charCodeAt(i) & 0xff);
+    }
+    const outer = ABOUT_CONT_TAG.slice();
+    writeVarint(outer, msg.length);
+    for (let i = 0; i < msg.length; i++) {
+      outer.push(msg[i]);
+    }
+    let bin = '';
+    for (let i = 0; i < outer.length; i++) {
+      bin += String.fromCharCode(outer[i]);
+    }
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+
+  const handleHttpFailure = (res, adaptConcurrency = false) => {
+    if (res.status === 429) {
+      cooldownUntil = Date.now() + 30000;
+      if (adaptConcurrency) {
+        maxConcurrent = Math.max(4, Math.floor(maxConcurrent / 2));
+      }
+    } else if (res.status >= 500) {
+      cooldownUntil = Date.now() + 30000;
+    }
+    throw new Error(`HTTP ${res.status}`);
+  };
+
   /**
-   * Fetches subscriber count using InnerTube API browse endpoint with request hints.
+   * Tier 1: Ultra-lightweight aboutChannelViewModel continuation (~198B response).
+   * @param {string} browseId
+   * @returns {Promise<string|null>}
+   */
+  const fetchAboutContinuation = async (browseId) => {
+    const res = await fetch(`/youtubei/v1/browse?prettyPrint=false&$fields=${ABOUT_FIELDS_QUERY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context: getYtContext(), continuation: buildAboutContinuation(browseId) }),
+      priority: 'low',
+    });
+    if (res.status === 400) {
+      useAboutContinuation = false;
+      return null;
+    }
+    if (!res.ok) handleHttpFailure(res, true);
+    const data = await res.json();
+    const vm =
+      data?.onResponseReceivedEndpoints?.[0]?.appendContinuationItemsAction
+        ?.continuationItems?.[0]?.aboutChannelRenderer?.metadata
+        ?.aboutChannelViewModel;
+    if (vm && typeof vm === 'object') {
+      return typeof vm.subscriberCountText === 'string' && vm.subscriberCountText
+        ? vm.subscriberCountText
+        : PRIVATE;
+    }
+    return null;
+  };
+
+  /**
+   * Tier 2: Projected header-only channel browse using lightweight Search tab params.
+   * @param {string} browseId
+   * @returns {Promise<string>}
+   */
+  const fetchBrowseHeader = async (browseId) => {
+    const res = await fetch(`/youtubei/v1/browse?prettyPrint=false&$fields=${BROWSE_HEADER_FIELDS_QUERY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context: getYtContext(), browseId, params: 'EgZzZWFyY2jyBgQKAloA' }),
+      priority: 'low',
+    });
+    if (!res.ok) handleHttpFailure(res, true);
+    const data = await res.json();
+    return parseInnerTube(data);
+  };
+
+  /**
+   * Tiered InnerTube fetcher with automatic circuit breaker back to header browse.
    * @param {string} browseId
    * @returns {Promise<string>}
    */
   const fetchInnerTube = async (browseId) => {
-    const res = await fetch('/youtubei/v1/browse?prettyPrint=false', {
+    if (useAboutContinuation) {
+      const fastRes = await fetchAboutContinuation(browseId);
+      if (fastRes !== null) {
+        aboutMissStreak = 0;
+        return fastRes;
+      }
+    }
+    const headerRes = await fetchBrowseHeader(browseId);
+    if (headerRes !== ERROR) {
+      aboutMissStreak++;
+      if (aboutMissStreak >= 3) {
+        useAboutContinuation = false;
+      }
+    }
+    return headerRes;
+  };
+
+  /**
+   * Tier 3: Resolves a handle/channel URL to a browseId without downloading full HTML.
+   * @param {string} channelUrl
+   * @returns {Promise<string|null>}
+   */
+  const resolveBrowseId = async (channelUrl) => {
+    const res = await fetch(`/youtubei/v1/navigation/resolve_url?prettyPrint=false&$fields=${RESOLVE_URL_FIELDS_QUERY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ context: getYtContext(), browseId }),
+      body: JSON.stringify({ context: getYtContext(), url: channelUrl }),
       priority: 'low',
     });
-    if (!res.ok) {
-      if (res.status === 429 || res.status >= 500) {
-        cooldownUntil = Date.now() + 30000;
-      }
-      throw new Error(`HTTP ${res.status}`);
-    }
+    if (!res.ok) handleHttpFailure(res, true);
     const data = await res.json();
-    return parseInnerTube(data);
+    return data?.endpoint?.browseEndpoint?.browseId || null;
   };
 
   /**
@@ -456,12 +677,7 @@
    */
   const fetchSubscriberCountStream = async (channelUrl) => {
     const res = await fetch(`${channelUrl}/about`, { priority: 'low' });
-    if (!res.ok) {
-      if (res.status === 429 || res.status >= 500) {
-        cooldownUntil = Date.now() + 30000;
-      }
-      throw new Error(`HTTP ${res.status}`);
-    }
+    if (!res.ok) handleHttpFailure(res, false);
 
     if (!res.body || typeof res.body.getReader !== 'function') {
       const text = await res.text();
@@ -483,7 +699,7 @@
       const match = extractSubscriberCountFast(buffer, searchFrom);
       lastScanLen = buffer.length;
       if (match) {
-        reader.cancel().catch(() => {});
+        reader.cancel().catch(() => { });
         return match;
       }
 
@@ -493,7 +709,7 @@
         if (!savedHeaderSlice && buffer.length >= headerIdx + 3500) {
           savedHeaderSlice = buffer.slice(headerIdx, headerIdx + 3500);
           const fallbackMatch = extractFallback(savedHeaderSlice);
-          reader.cancel().catch(() => {});
+          reader.cancel().catch(() => { });
           return fallbackMatch;
         }
       }
@@ -509,24 +725,28 @@
   };
 
   /**
-   * Unified fetch dispatcher: attempts InnerTube browse first, falls back to stream.
+   * Unified fetch dispatcher: InnerTube continuation -> header browse -> resolve_url -> stream fallback.
    * @param {string|null} browseId
    * @param {string} channelUrl
    * @returns {Promise<string>}
    */
   const fetchSubscriberCount = async (browseId, channelUrl) => {
     try {
-      if (browseId) {
-        return await fetchInnerTube(browseId);
+      let targetId = browseId;
+      if (!targetId && channelUrl) {
+        targetId = await resolveBrowseId(channelUrl);
+      }
+      if (targetId) {
+        return await fetchInnerTube(targetId);
       }
       const streamRes = await fetchSubscriberCountStream(channelUrl);
       return streamRes ?? PRIVATE;
     } catch (err) {
-      if (browseId && channelUrl) {
+      if (channelUrl) {
         try {
           const fallbackRes = await fetchSubscriberCountStream(channelUrl);
           return fallbackRes ?? PRIVATE;
-        } catch {}
+        } catch { }
       }
       if (DEBUG) console.warn('[Commenter Subscribers] Fetch failed for:', channelUrl || browseId, err);
       return ERROR;
@@ -534,61 +754,32 @@
   };
 
   /**
-   * Fast channel URL & handle normalizer with decodeURIComponent and case-normalization.
-   * @param {string} rawUrl
-   * @returns {string}
-   */
-  const normalizeChannelUrl = (rawUrl) => {
-    if (!rawUrl) return '';
-    try {
-      const origin = location.origin;
-      let path = rawUrl.startsWith(origin) ? rawUrl.slice(origin.length) : rawUrl.replace(/^https?:\/\/[^/]+/, '');
-      const qIdx = path.indexOf('?');
-      if (qIdx !== -1) path = path.slice(0, qIdx);
-      const hIdx = path.indexOf('#');
-      if (hIdx !== -1) path = path.slice(0, hIdx);
-      try {
-        path = decodeURIComponent(path);
-      } catch {}
-      while (path.endsWith('/') && path.length > 1) {
-        path = path.slice(0, -1);
-      }
-      if (path.startsWith('/@')) {
-        path = '/@' + path.slice(2).toLowerCase();
-      }
-      return origin + path;
-    } catch {
-      return rawUrl;
-    }
-  };
-
-  /**
    * Normalizes channel target and manages queued fetching with multi-tier caching.
    * In-flight requests are shared across callers and populate cache on completion.
    * @param {string} rawUrl
+   * @param {string} channelPath
    * @param {string|null} browseId
    * @param {AbortSignal} [signal]
    * @returns {Promise<string>}
    */
-  const getSubs = (rawUrl, browseId, signal) => {
-    const channelUrl = normalizeChannelUrl(rawUrl);
-    const primaryKey = browseId || channelUrl;
+  const getSubs = (rawUrl, channelPath, browseId, signal) => {
+    const primaryKey = browseId || channelPath;
     if (!primaryKey) return Promise.resolve(null);
 
     const cachedPrimary = getCachedValue(primaryKey);
     if (cachedPrimary !== undefined) {
       return Promise.resolve(cachedPrimary);
     }
-    if (channelUrl) {
-      const cachedUrl = getCachedValue(channelUrl);
-      if (cachedUrl !== undefined) {
-        return Promise.resolve(cachedUrl);
+    if (channelPath) {
+      const cachedPath = getCachedValue(channelPath);
+      if (cachedPath !== undefined) {
+        return Promise.resolve(cachedPath);
       }
     }
 
-    const opSub = getOpSubscriberCount(null, browseId, channelUrl);
+    const opSub = getOpSubscriberCount(browseId, channelPath);
     if (opSub !== undefined) {
-      setCachedValue(browseId, channelUrl, opSub);
+      setCachedValue(browseId, channelPath, opSub);
       return Promise.resolve(opSub);
     }
 
@@ -600,7 +791,7 @@
     // Wait for an active slot in the LIFO queue (cancellable while waiting)
     return enqueueRequest((resolve, reject) => {
       // Re-check cache / in-flight when finally starting
-      const reCached = getCachedValue(primaryKey) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
+      const reCached = getCachedValue(primaryKey) ?? (channelPath ? getCachedValue(channelPath) : undefined);
       if (reCached !== undefined) {
         resolve(reCached);
         return Promise.resolve();
@@ -611,13 +802,14 @@
         return Promise.resolve();
       }
 
+      const channelUrl = rawUrl ? normalizeChannelUrl(rawUrl) : (channelPath ? location.origin + channelPath : '');
       const inFlight = fetchSubscriberCount(browseId, channelUrl)
         .then((result) => {
-          setCachedValue(primaryKey, channelUrl, result);
+          setCachedValue(primaryKey, channelPath, result);
           return result;
         })
         .catch(() => {
-          setCachedValue(primaryKey, channelUrl, ERROR);
+          setCachedValue(primaryKey, channelPath, ERROR);
           return ERROR;
         })
         .finally(() => {
@@ -644,7 +836,7 @@
     }
     const parentComment = commentElement || anchor?.closest('ytd-comment-view-model');
     if (parentComment) {
-      const thumb = parentComment.querySelector('a#author-thumbnail');
+      const thumb = parentComment.querySelector('#author-thumbnail a, a#author-thumbnail');
       const winThumb = thumb?.wrappedJSObject || thumb;
       if (winThumb?.data?.browseEndpoint?.browseId) {
         return winThumb.data.browseEndpoint.browseId;
@@ -661,11 +853,30 @@
     return null;
   };
 
-  const activeControllers = new WeakMap();
+  let activeControllers = new WeakMap();
   const activeControllerSet = new Set();
+  let commentState = new WeakMap();
+  const pendingBadgeWrites = new Map();
+  let badgeRafId = null;
 
-  const ensureBadge = (header) => {
-    let badge = header.querySelector('.subscriber-count');
+  const getOrCreateState = (commentElement) => {
+    let state = commentState.get(commentElement);
+    if (!state) {
+      state = {
+        header: null,
+        anchor: null,
+        badge: null,
+        resolvedTarget: null,
+        activeTarget: null,
+        awaitingHref: false,
+      };
+      commentState.set(commentElement, state);
+    }
+    return state;
+  };
+
+  const ensureBadge = (header, state) => {
+    let badge = state?.badge?.isConnected ? state.badge : header.querySelector('.subscriber-count');
     if (!badge) {
       badge = document.createElement('span');
       badge.className = 'subscriber-count';
@@ -684,47 +895,83 @@
     badge.classList.remove('is-loading');
   };
 
-  const resolveSync = (browseId, channelUrl, header) => {
-    const key = browseId || channelUrl;
-    let cached = getCachedValue(key) ?? (channelUrl ? getCachedValue(channelUrl) : undefined);
+  const flushBadgeWrites = () => {
+    badgeRafId = null;
+    if (pendingBadgeWrites.size === 0) return;
+    const jobs = Array.from(pendingBadgeWrites.entries());
+    pendingBadgeWrites.clear();
+
+    for (let i = 0; i < jobs.length; i++) {
+      const [commentElement, job] = jobs[i];
+      if (!commentElement.isConnected || !job.header.isConnected || !job.anchor.isConnected) continue;
+      if (job.anchor.href !== job.targetUrl) continue;
+
+      const state = getOrCreateState(commentElement);
+      const badge = ensureBadge(job.header, state);
+      badge.dataset.target = job.targetUrl;
+      applyBadgeContent(badge, job.subCount);
+
+      state.header = job.header;
+      state.anchor = job.anchor;
+      state.badge = badge;
+      state.resolvedTarget = job.targetUrl;
+      state.activeTarget = null;
+      state.awaitingHref = false;
+      unobserveComment(commentElement);
+    }
+  };
+
+  const scheduleBadgeWrite = (commentElement, header, anchor, targetUrl, subCount) => {
+    pendingBadgeWrites.set(commentElement, { header, anchor, targetUrl, subCount });
+    if (badgeRafId === null) {
+      badgeRafId = requestAnimationFrame(flushBadgeWrites);
+    }
+  };
+
+  const resolveSync = (browseId, channelPath) => {
+    const key = browseId || channelPath;
+    let cached = getCachedValue(key) ?? (channelPath ? getCachedValue(channelPath) : undefined);
     if (cached === undefined) {
-      const opSub = getOpSubscriberCount(header, browseId, channelUrl);
+      const opSub = getOpSubscriberCount(browseId, channelPath);
       if (opSub !== undefined) {
         cached = opSub;
-        setCachedValue(browseId, channelUrl, opSub);
+        setCachedValue(browseId, channelPath, opSub);
       }
     }
     return cached;
   };
 
-  const updateBadge = async (anchor, header, signal, commentElement, browseId, controller) => {
+  const updateBadge = async (anchor, header, signal, commentElement, browseId, channelPath, controller) => {
     const targetUrl = anchor.href;
     if (!targetUrl) return;
 
     try {
-      const subCount = await getSubs(targetUrl, browseId, signal);
+      const subCount = await getSubs(targetUrl, channelPath, browseId, signal);
 
       if (signal?.aborted) return;
       if (anchor.href !== targetUrl) return;
 
+      const state = getOrCreateState(commentElement);
       if (subCount === ERROR) {
-        const badge = header.querySelector('.subscriber-count');
+        const badge = state.badge?.isConnected ? state.badge : header.querySelector('.subscriber-count');
         if (badge) badge.classList.add('is-loading');
+        state.resolvedTarget = null;
         return;
       }
 
-      const badge = ensureBadge(header);
-      badge.dataset.target = targetUrl;
-      applyBadgeContent(badge, subCount);
-
-      if (commentElement) {
-        unobserveComment(commentElement);
-      }
+      scheduleBadgeWrite(commentElement, header, anchor, targetUrl, subCount);
+      unobserveComment(commentElement);
     } catch (err) {
       if (err.name === 'AbortError') return;
     } finally {
-      if (commentElement && activeControllers.get(commentElement) === controller) {
-        activeControllers.delete(commentElement);
+      if (commentElement) {
+        if (activeControllers.get(commentElement) === controller) {
+          activeControllers.delete(commentElement);
+        }
+        const state = commentState.get(commentElement);
+        if (state && state.activeTarget === targetUrl) {
+          state.activeTarget = null;
+        }
       }
       if (controller) {
         activeControllerSet.delete(controller);
@@ -753,7 +1000,7 @@
 
   const resolveOpInfo = () => {
     if (isShorts()) {
-      cachedOpInfo = { subText: null, ownerUrl: null, ownerBrowseId: null };
+      cachedOpInfo = { subText: null, ownerPath: null, ownerBrowseId: null };
       return cachedOpInfo;
     }
 
@@ -772,7 +1019,7 @@
     const subText = subEl?.textContent?.trim();
     if (!subText) {
       if (ownerEl?.querySelector('a[href^="/@"], a[href^="/channel/"]')) {
-        cachedOpInfo = { subText: null, ownerUrl: null, ownerBrowseId: null };
+        cachedOpInfo = { subText: null, ownerPath: null, ownerBrowseId: null };
         return cachedOpInfo;
       }
       return null;
@@ -782,51 +1029,47 @@
       'a.yt-simple-endpoint[href^="/@"], a.yt-simple-endpoint[href^="/channel/"], a[href^="/@"], a[href^="/channel/"]'
     );
     const ownerHref = ownerAnchor?.getAttribute('href');
-    const ownerUrl = ownerHref ? normalizeChannelUrl(ownerHref) : null;
+    const ownerPath = ownerHref ? normalizeChannelPath(ownerHref) : null;
     const ownerBrowseId =
       ownerAnchor?.data?.browseEndpoint?.browseId ||
       ownerAnchor?.wrappedJSObject?.data?.browseEndpoint?.browseId ||
       ownerEl?.data?.navigationEndpoint?.browseEndpoint?.browseId;
 
-    if (!ownerUrl && !ownerBrowseId) return null;
+    if (!ownerPath && !ownerBrowseId) return null;
 
     cachedOpInfo = {
       subText,
       ownerBrowseId: ownerBrowseId || null,
-      ownerUrl: ownerUrl || null,
+      ownerPath: ownerPath || null,
     };
     return cachedOpInfo;
   };
 
-  const getOpSubscriberCount = (header, browseId, channelUrl) => {
+  const getOpSubscriberCount = (browseId, channelPath) => {
     const op = cachedOpInfo || resolveOpInfo();
     if (!op?.subText) return undefined;
 
-    const matchesUrl = channelUrl && op.ownerUrl && channelUrl === op.ownerUrl;
-    const matchesBrowseId = browseId && op.ownerBrowseId && browseId === op.ownerBrowseId;
-
-    if (header?.querySelector('span#author-comment-badge:not([hidden]) ytd-author-comment-badge-renderer')) {
-      if (matchesUrl || matchesBrowseId || (!op.ownerUrl && !op.ownerBrowseId)) {
-        return op.subText;
-      }
-      return undefined;
-    }
-    if (matchesBrowseId || matchesUrl) {
+    if (
+      (browseId && op.ownerBrowseId && browseId === op.ownerBrowseId) ||
+      (channelPath && op.ownerPath && channelPath === op.ownerPath)
+    ) {
       return op.subText;
     }
     return undefined;
   };
 
   /**
-   * Finds the commenter's channel link inside the comment header.
+   * Finds the commenter's channel link inside the comment header (fast-path on #author-text).
    */
-  const getAuthorAnchor = (header) =>
-    header.querySelector(
-      'a#author-text:not([hidden]), span#author-comment-badge:not([hidden]) a#name, a#name:not([hidden])'
-    ) ||
-    header.querySelector('a#author-text, a#name') ||
-    header.querySelector('a[href^="/@"], a[href^="/channel/"]') ||
-    header.querySelector('a');
+  const getAuthorAnchor = (header) => {
+    const authorText = header.querySelector('a#author-text');
+    if (authorText && !authorText.hidden) return authorText;
+    return (
+      header.querySelector('span#author-comment-badge:not([hidden]) a#name, a#name:not([hidden])') ||
+      authorText ||
+      header.querySelector('a#name, a[href^="/@"], a[href^="/channel/"], a')
+    );
+  };
 
   let observedComments = new WeakSet();
 
@@ -841,7 +1084,14 @@
       ctrl.abort();
     }
     activeControllerSet.clear();
+    activeControllers = new WeakMap();
+    commentState = new WeakMap();
     observedComments = new WeakSet();
+    pendingBadgeWrites.clear();
+    if (badgeRafId !== null) {
+      cancelAnimationFrame(badgeRafId);
+      badgeRafId = null;
+    }
     viewportObserver.disconnect();
   };
 
@@ -852,48 +1102,86 @@
   const initComment = (commentElement) => {
     const header = commentElement.querySelector('div#header-author');
     if (!header) {
+      getOrCreateState(commentElement).awaitingHref = true;
       unobserveComment(commentElement);
       return;
     }
 
     const anchor = getAuthorAnchor(header);
-    if (!anchor) {
+    if (!anchor || !anchor.href) {
+      const state = getOrCreateState(commentElement);
+      state.header = header;
+      state.anchor = anchor || null;
+      state.awaitingHref = true;
+      unobserveComment(commentElement);
+      return;
+    }
+
+    const targetUrl = anchor.href;
+    const state = getOrCreateState(commentElement);
+    state.header = header;
+    state.anchor = anchor;
+    state.awaitingHref = false;
+
+    if (state.resolvedTarget === targetUrl && state.badge?.isConnected) {
       unobserveComment(commentElement);
       return;
     }
 
     const browseId = getBrowseId(anchor, commentElement);
-    const channelUrl = normalizeChannelUrl(anchor.href);
-    const targetUrl = anchor.href;
+    const channelPath = normalizeChannelPath(targetUrl);
 
-    const cached = resolveSync(browseId, channelUrl, header);
+    const cached = resolveSync(browseId, channelPath);
     if (cached !== undefined) {
       if (cached !== ERROR) {
-        const badge = ensureBadge(header);
-        badge.dataset.target = targetUrl;
-        applyBadgeContent(badge, cached);
+        scheduleBadgeWrite(commentElement, header, anchor, targetUrl, cached);
       } else {
-        const badge = header.querySelector('.subscriber-count');
+        const badge = state.badge?.isConnected ? state.badge : header.querySelector('.subscriber-count');
         if (badge) badge.classList.add('is-loading');
+        state.resolvedTarget = null;
       }
       unobserveComment(commentElement);
       return;
     }
 
-    let badge = header.querySelector('.subscriber-count');
-    if (badge) {
-      badge.classList.add('is-loading');
+    const existingBadge = state.badge?.isConnected ? state.badge : header.querySelector('.subscriber-count');
+    if (existingBadge) {
+      state.badge = existingBadge;
+      if (state.resolvedTarget !== targetUrl) {
+        existingBadge.classList.add('is-loading');
+        state.resolvedTarget = null;
+      }
     }
 
-    if (activeControllers.has(commentElement)) return;
+    const prevCtrl = activeControllers.get(commentElement);
+    if (prevCtrl) {
+      if (state.activeTarget === targetUrl) return;
+      prevCtrl.abort();
+      activeControllers.delete(commentElement);
+      activeControllerSet.delete(prevCtrl);
+    }
 
     const controller = new AbortController();
+    state.activeTarget = targetUrl;
     activeControllers.set(commentElement, controller);
     activeControllerSet.add(controller);
-    updateBadge(anchor, header, controller.signal, commentElement, browseId, controller);
+    updateBadge(anchor, header, controller.signal, commentElement, browseId, channelPath, controller);
   };
 
   const isCommentResolved = (commentElement) => {
+    const pending = pendingBadgeWrites.get(commentElement);
+    if (pending && pending.anchor?.isConnected && pending.anchor.href === pending.targetUrl) {
+      return true;
+    }
+    const state = commentState.get(commentElement);
+    if (state) {
+      return Boolean(
+        state.resolvedTarget &&
+        state.badge?.isConnected &&
+        state.anchor?.isConnected &&
+        state.anchor.href === state.resolvedTarget
+      );
+    }
     const header = commentElement.querySelector('div#header-author');
     const badge = header?.querySelector('.subscriber-count');
     if (!badge || badge.classList.contains('is-loading')) return false;
@@ -901,7 +1189,7 @@
     return Boolean(anchor?.href && badge.dataset.target === anchor.href);
   };
 
-  // Viewport observer with 400px margin for pre-emptive loading and viewport exit cancellation
+  // Viewport observer with 600px margin for pre-emptive loading and viewport exit cancellation
   const viewportObserver = new IntersectionObserver(
     (entries) => {
       for (let i = 0; i < entries.length; i++) {
@@ -915,11 +1203,13 @@
             controller.abort();
             activeControllers.delete(el);
             activeControllerSet.delete(controller);
+            const state = commentState.get(el);
+            if (state) state.activeTarget = null;
           }
         }
       }
     },
-    { rootMargin: '400px 0px' }
+    { rootMargin: '600px 0px' }
   );
 
   const queueComment = (commentElement, force = false) => {
@@ -937,6 +1227,31 @@
     viewportObserver.observe(commentElement);
   };
 
+  const SKIP_CONTAINER_TAGS = new Set([
+    'SPAN',
+    'A',
+    'BUTTON',
+    'IMG',
+    'SVG',
+    'PATH',
+    'H3',
+    'SLOT',
+    'TEMPLATE',
+    'DOM-REPEAT',
+    'YT-ICON',
+    'YT-ICON-BUTTON',
+    'YT-BUTTON-SHAPE',
+    'YT-ATTRIBUTED-STRING',
+    'YT-FORMATTED-STRING',
+    'YT-IMG-SHADOW',
+    'YT-INTERACTION',
+    'TP-YT-PAPER-BUTTON',
+    'TP-YT-PAPER-TOOLTIP',
+    'YT-PDG-COMMENT-CHIP-RENDERER',
+    'YTD-COMMENT-ENGAGEMENT-BAR',
+    'YTD-MENU-RENDERER',
+  ]);
+
   // Single shared MutationObserver scoped strictly to the comments thread container.
   const commentsObserver = new MutationObserver((mutations) => {
     for (let i = 0; i < mutations.length; i++) {
@@ -945,41 +1260,60 @@
       // Handle element reuse / href changes (virtual DOM recycling)
       if (m.type === 'attributes' && m.attributeName === 'href') {
         const anchor = m.target;
-        if (isAuthorAnchor(anchor)) {
-          const header =
-            anchor.parentElement?.id === 'header-author'
-              ? anchor.parentElement
-              : anchor.closest('div#header-author');
-          if (header) {
-            const comment = anchor.closest('ytd-comment-view-model');
-            if (comment) {
+        if (isAuthorAnchor(anchor) && anchor.href) {
+          const comment = anchor.closest('ytd-comment-view-model');
+          if (comment) {
+            const state = commentState.get(comment);
+            if (state && (state.resolvedTarget === anchor.href || state.activeTarget === anchor.href)) {
+              continue;
+            }
+            if (state?.activeTarget && state.activeTarget !== anchor.href) {
               const ctrl = activeControllers.get(comment);
               if (ctrl) {
                 ctrl.abort();
                 activeControllers.delete(comment);
                 activeControllerSet.delete(ctrl);
               }
-              const badge = header.querySelector('.subscriber-count');
-              if (badge && badge.dataset.target !== anchor.href) {
-                badge.classList.add('is-loading');
-              }
+              state.activeTarget = null;
+            }
+            if (state?.resolvedTarget && state.resolvedTarget !== anchor.href) {
+              const badge = state.badge?.isConnected
+                ? state.badge
+                : state.header?.querySelector('.subscriber-count');
+              if (badge) badge.classList.add('is-loading');
+              state.resolvedTarget = null;
+              pendingBadgeWrites.delete(comment);
               queueComment(comment, true);
+            } else if (state?.awaitingHref) {
+              state.awaitingHref = false;
+              pendingBadgeWrites.delete(comment);
+              queueComment(comment, true);
+            } else if (!observedComments.has(comment)) {
+              queueComment(comment);
             }
           }
         }
         continue;
       }
 
-      // Handle newly added comments and thread blocks
+      // Handle newly added comments and header elements
       const added = m.addedNodes;
       for (let j = 0; j < added.length; j++) {
         const node = added[j];
         if (node.nodeType !== 1) continue;
         if (node.classList.contains('subscriber-count')) continue;
 
-        if (node.tagName === 'YTD-COMMENT-VIEW-MODEL') {
+        const tag = node.tagName;
+        if (tag === 'YTD-COMMENT-VIEW-MODEL') {
           queueComment(node);
-        } else {
+        } else if (node.id === 'header-author' || node.id === 'author-text' || node.id === 'name') {
+          const parentComment = node.closest('ytd-comment-view-model');
+          const state = parentComment ? commentState.get(parentComment) : null;
+          if (state?.awaitingHref) {
+            state.awaitingHref = false;
+            queueComment(parentComment, true);
+          }
+        } else if (node.childElementCount > 0 && !SKIP_CONTAINER_TAGS.has(tag)) {
           const comments = node.getElementsByTagName('ytd-comment-view-model');
           for (let k = 0; k < comments.length; k++) {
             queueComment(comments[k]);
@@ -987,27 +1321,21 @@
         }
       }
 
-      if (m.addedNodes.length > 0) continue;
-
-      // Ignore mutations originating from or directly adding the badge itself
-      if (
-        m.target.nodeType === 1 &&
-        !m.target.classList.contains('subscriber-count')
-      ) {
-        if (
-          m.addedNodes.length === 1 &&
-          m.addedNodes[0].nodeType === 1 &&
-          m.addedNodes[0].classList.contains('subscriber-count')
-        ) {
-          continue;
-        }
-
-        const parentComment =
-          m.target.tagName === 'YTD-COMMENT-VIEW-MODEL'
-            ? m.target
-            : m.target.closest('ytd-comment-view-model');
-        if (parentComment) {
-          queueComment(parentComment);
+      // Re-queue comment only if our own badge was removed externally
+      const removed = m.removedNodes;
+      for (let j = 0; j < removed.length; j++) {
+        const node = removed[j];
+        if (node.nodeType === 1 && node.classList.contains('subscriber-count')) {
+          const parentComment = m.target.closest?.('ytd-comment-view-model');
+          if (parentComment) {
+            const state = commentState.get(parentComment);
+            if (state) {
+              state.badge = null;
+              state.resolvedTarget = null;
+            }
+            pendingBadgeWrites.delete(parentComment);
+            queueComment(parentComment, true);
+          }
         }
       }
     }
@@ -1129,6 +1457,7 @@
 
   // Clean SPA navigation handling with complete observer teardown
   window.addEventListener('yt-navigate-finish', () => {
+    cachedContext = null;
     commentsObserver.disconnect();
     resetViewportObserver();
     if (pageObserver) {
