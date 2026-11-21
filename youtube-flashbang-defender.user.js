@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Flashbang Defender
 // @namespace    https://github.com/EndzE
-// @version      1.5.0
+// @version      1.5.1
 // @description  Your favourite creators don't care about your eyes opening fully white pages in their videos? Care about your eyes yourself with Flashbang Defender.
 // @author       EndzE
 // @license      MIT
@@ -960,8 +960,8 @@ void main() {
     height: 40px;
     border-radius: 20px;
     border: none;
-    background-color: var(--yt-spec-badge-chip-background, rgba(255, 255, 255, 0.1));
-    color: var(--yt-spec-text-primary, #f1f1f1);
+    background-color: var(--yt-spec-badge-chip-background, var(--yt-sys-color-baseline--additive-background, rgba(0, 0, 0, 0.05)));
+    color: var(--yt-spec-text-primary, var(--yt-sys-color-baseline--text-primary, #0f0f0f));
     cursor: pointer;
     padding: 0;
     margin: 0;
@@ -969,7 +969,14 @@ void main() {
     transition: background-color 0.2s;
 }
 #yt-flashbang-defender-wrapper:hover #yt-flashbang-defender-btn {
-    background-color: var(--yt-spec-button-chip-background-hover, rgba(255, 255, 255, 0.2));
+    background-color: var(--yt-spec-button-chip-background-hover, var(--yt-sys-color-baseline--button-chip-background-hover, rgba(0, 0, 0, 0.1)));
+}
+html[dark] #yt-flashbang-defender-btn {
+    background-color: var(--yt-spec-badge-chip-background, var(--yt-sys-color-baseline--additive-background, rgba(255, 255, 255, 0.1)));
+    color: var(--yt-spec-text-primary, var(--yt-sys-color-baseline--text-primary, #f1f1f1));
+}
+html[dark] #yt-flashbang-defender-wrapper:hover #yt-flashbang-defender-btn {
+    background-color: var(--yt-spec-button-chip-background-hover, var(--yt-sys-color-baseline--button-chip-background-hover, rgba(255, 255, 255, 0.2)));
 }
 #yt-fbd-green-dot {
     position: absolute;
@@ -978,16 +985,20 @@ void main() {
     width: 5px;
     height: 5px;
     border-radius: 50%;
+    background-color: #00c853;
+    box-shadow: 0 0 3px rgba(0, 200, 83, 0.7);
+    pointer-events: none;
+}
+html[dark] #yt-fbd-green-dot {
     background-color: #00e676;
     box-shadow: 0 0 3px rgba(0, 230, 118, 0.7);
-    pointer-events: none;
 }
 #yt-flashbang-defender-btn[aria-pressed="false"] #yt-fbd-green-dot {
     display: none;
 }
 #yt-flashbang-defender-tooltip {
     position: absolute;
-    top: calc(100% + 10px);
+    bottom: calc(100% + 10px);
     left: 50%;
     transform: translateX(-50%);
     background-color: rgba(97, 97, 97, 0.95);
@@ -1020,13 +1031,16 @@ void main() {
     width: 48px;
     height: 48px;
     border-radius: 24px;
-    color: #f1f1f1;
 }
 #yt-flashbang-defender-wrapper[data-layout="shorts"] #yt-fbd-green-dot {
     top: 8px;
     right: 8px;
     width: 6px;
     height: 6px;
+}
+#yt-flashbang-defender-wrapper[data-layout="shorts"] #yt-flashbang-defender-tooltip {
+    top: calc(100% + 10px);
+    bottom: auto;
 }
 #yt-flashbang-defender-popup {
     position: fixed;
