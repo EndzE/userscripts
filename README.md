@@ -5,7 +5,7 @@ A collection of useful userscripts.
 ## Scripts
 
 ### AIStudio - Stop Exposing Email
-Hides your Google account email from the top navigation bar before first paint, replaces it with your display name, and strips it from accessibility labels and hover tooltips.
+Hides your Google account email before first paint, replaces it with your display name, and strips it from accessibility labels and hover tooltips.
 
 - **File:** [`aistudio-stop-exposing-email.user.js`](aistudio-stop-exposing-email.user.js)
 - **Install:** [Direct Install](https://raw.githubusercontent.com/EndzE/userscripts/main/aistudio-stop-exposing-email.user.js) · [Greasy Fork](https://greasyfork.org/en/scripts/606673-aistudio-stop-exposing-email)
